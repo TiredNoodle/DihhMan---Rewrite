@@ -14,6 +14,7 @@ local gameState = "menu"          -- "menu", "connecting", or "playing"
 local localPlayer = nil           -- The player controlled by this instance
 local remotePlayers = {}          -- Table of other players connected
 local myPlayerId = nil            -- Our assigned player ID from server
+local enemies = {} 							 	-- Table of active enemies
 local mainMenu = nil              -- Main menu UI instance
 local debugFont = nil             -- Font for debug information display
 local showDebugInfo = true        -- Toggles debug overlay (set to TRUE for debugging)
@@ -136,6 +137,33 @@ function setupNetworkCallbacks()
         end
     end)
 
+		-- Enemy related stuff
+		Network.setEnemySpawnedCallback(function(data)
+		    print("Enemy spawned:", data.id, "type:", data.type)
+		    createEnemy(data.id, data)
+		end)
+
+		Network.setEnemyUpdatedCallback(function(data)
+		    if enemies[data.id] then
+		        enemies[data.id]:applyNetworkState(data)
+		    end
+		end)
+
+		Network.setEnemyDiedCallback(function(data)
+		    print("Enemy died:", data.id)
+		    if enemies[data.id] then
+		        enemies[data.id] = nil
+		    end
+		end)
+
+		-- Called when a player successfully performs an action
+		Network.setPlayerActionCallback(function(data)
+		    -- Apply action effect to remote player
+		    if remotePlayers[data.playerId] then
+		        remotePlayers[data.playerId]:applyActionEffect(data)
+		    end
+		end)
+
     -- Called when host successfully creates a game
     Network.setHostCreatedCallback(function()
         print("Network: Host game created - creating local player")
@@ -200,6 +228,16 @@ function createRemotePlayer(id, data)
     player.health = data.health or 100
     remotePlayers[id] = player
     print(string.format("Remote player '%s' created at (%d, %d)", id, data.x, data.y))
+end
+
+-- Creates a visual representation of a enemy
+function createEnemy(enemyId, data)
+    local Enemy = require "src.entities.Enemy"
+    local enemy = Enemy:new("Enemy_" .. enemyId, data.x, data.y, data.type)
+    enemy.health = data.health or 100
+    enemy.enemyId = enemyId
+    enemies[enemyId] = enemy
+    print(string.format("Enemy %s created at (%d, %d)", enemyId, data.x, data.y))
 end
 
 -- GAME STATE TRANSITIONS
@@ -277,6 +315,20 @@ function love.update(dt)
             end
         end
 
+				-- Update enemies
+        for id, enemy in pairs(enemies) do
+            if enemy then
+                -- Get all players for enemy AI
+                local allPlayers = {}
+                if localPlayer then table.insert(allPlayers, localPlayer) end
+                for _, remotePlayer in pairs(remotePlayers) do
+                    if remotePlayer then table.insert(allPlayers, remotePlayer) end
+                end
+
+                enemy:update(dt, allPlayers)
+            end
+        end
+
         -- Update all base characters (enemies, etc.)
         BaseCharacter.updateAll(dt)
     end
@@ -300,6 +352,13 @@ function love.draw()
         love.graphics.setColor(1, 1, 1)
         love.graphics.print("Connecting to server...", 350, 300)
     elseif gameState == "playing" then
+			-- Draw enemies first (background)
+			for id, enemy in pairs(enemies) do
+					if enemy then
+							enemy:draw()
+					end
+			end
+
         -- DEBUG: Draw coordinate grid for troubleshooting
         drawDebugGrid()
 
@@ -308,7 +367,7 @@ function love.draw()
         love.graphics.circle("fill", 0, 0, 10)
         love.graphics.setColor(1, 1, 1)
 
-        -- Draw remote players first (background)
+        -- Draw remote players
         for id, remotePlayer in pairs(remotePlayers) do
             if remotePlayer then  -- Check if player still exists
                 remotePlayer:draw()
@@ -375,7 +434,8 @@ function drawGameUI()
     love.graphics.print("Connected: " .. (Network.isConnected() and "YES" or "NO"), 10, 50)
     love.graphics.print("My ID: " .. (myPlayerId or "none"), 10, 70)
     love.graphics.print("Remote Players: " .. tableCount(remotePlayers), 10, 90)
-
+    love.graphics.print("Enemies: " .. tableCount(enemies), 10, 110)
+		
     if localPlayer then
         love.graphics.print("Local Pos: " .. math.floor(localPlayer.x) .. "," .. math.floor(localPlayer.y), 10, 110)
     end
