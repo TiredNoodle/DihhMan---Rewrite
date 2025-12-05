@@ -144,6 +144,13 @@ function NetworkPlayer:drawHealthBar()
     end
 end
 
+-- Apply action effect from network (for visual effects only)
+function NetworkPlayer:applyActionEffect(effectData)
+    -- This can be expanded with visual effects
+    print(string.format("NetworkPlayer %s: %s action at (%.1f, %.1f)",
+          self.id, effectData.action, effectData.x, effectData.y))
+end
+
 -- Applies network update to this player
 -- @param data: Network data containing new CENTER position and state
 function NetworkPlayer:applyNetworkUpdate(data)

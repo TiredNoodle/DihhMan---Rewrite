@@ -434,8 +434,8 @@ function drawGameUI()
     love.graphics.print("Connected: " .. (Network.isConnected() and "YES" or "NO"), 10, 50)
     love.graphics.print("My ID: " .. (myPlayerId or "none"), 10, 70)
     love.graphics.print("Remote Players: " .. tableCount(remotePlayers), 10, 90)
-    love.graphics.print("Enemies: " .. tableCount(enemies), 10, 110)
-		
+    love.graphics.print("Enemies: " .. tableCount(enemies), 10, 350)
+
     if localPlayer then
         love.graphics.print("Local Pos: " .. math.floor(localPlayer.x) .. "," .. math.floor(localPlayer.y), 10, 110)
     end

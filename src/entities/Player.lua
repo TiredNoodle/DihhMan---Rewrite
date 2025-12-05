@@ -1,6 +1,7 @@
 -- src/entities/Player.lua
 -- Represents the player-controlled character with actions
 local BaseCharacter = require "src.entities.BaseCharacter"
+local Network = require "src.core.Network"
 
 local Player = BaseCharacter:subclass('Player')
 
