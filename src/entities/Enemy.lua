@@ -1,5 +1,5 @@
 -- src/entities/Enemy.lua
--- AI-controlled enemy character. Inherits from BaseCharacter.
+-- AI-controlled enemy character with network synchronization
 local BaseCharacter = require "src.entities.BaseCharacter"
 
 local Enemy = BaseCharacter:subclass('Enemy')
@@ -12,31 +12,59 @@ function Enemy:initialize(name, x, y, enemyType)
     self.type = enemyType or "melee"
     self.damage = 10
     self.attackRange = 50
-    self.aggroRange = 200
+    self.aggroRange = 300  -- Increased for open arena
     self.attackCooldown = 1.5
     self.attackTimer = 0
+    self.targetPlayer = nil
+    self.enemyId = tostring(love.math.random(10000, 99999)) -- Unique ID for networking
 
     -- Type-specific property overrides
     if enemyType == "ranged" then
         self.color = {1, 0.5, 0}  -- Orange
-        self.speed = 80
-        self.aggroRange = 300 -- Ranged enemies spot you from farther away
+        self.speed = 120
+        self.aggroRange = 400
+        self.attackRange = 200  -- Ranged enemies attack from farther
     elseif enemyType == "boss" then
         self.color = {0.5, 0, 0.5}  -- Purple
         self.width = 80
         self.height = 80
         self.health = 300
         self.maxHealth = 300
-        self.speed = 60
+        self.speed = 80
         self.damage = 25
+        self.attackRange = 80
     else -- "melee" (default)
         self.color = {0.8, 0.2, 0.2}  -- Red
-        self.speed = 100
+        self.speed = 120
     end
+
+    print(string.format("Enemy '%s' (%s) created at (%d, %d)",
+          self.name, self.type, x, y))
 end
 
--- UPDATED: AI behavior. Now uses BaseCharacter:move() for collision-aware movement.
-function Enemy:update(dt, target)
+-- Find closest player to target
+function Enemy:findTarget(players)
+    local closestPlayer = nil
+    local closestDistance = math.huge
+
+    for _, player in ipairs(players) do
+        if player.isAlive then
+            local dx = player.x - self.x
+            local dy = player.y - self.y
+            local distance = math.sqrt(dx*dx + dy*dy)
+
+            if distance < closestDistance and distance < self.aggroRange then
+                closestDistance = distance
+                closestPlayer = player
+            end
+        end
+    end
+
+    return closestPlayer, closestDistance
+end
+
+-- UPDATED: AI behavior with network synchronization
+function Enemy:update(dt, players)
     -- 1. Update base movement and collision
     BaseCharacter.update(self, dt)
 
@@ -45,29 +73,48 @@ function Enemy:update(dt, target)
         self.attackTimer = self.attackTimer - dt
     end
 
-    -- 3. Execute AI if there's a valid target
-    if target and target.isAlive and self:distanceTo(target) < self.aggroRange then
-        self:chase(target, dt)
+    -- 3. Find and chase target
+    if players and #players > 0 then
+        local target, distance = self:findTarget(players)
+
+        if target and target.isAlive then
+            self.targetPlayer = target
+            self:chase(target, dt, distance)
+        else
+            -- Idle behavior: wander randomly
+            self:randomWander(dt)
+        end
     else
-        -- Idle behavior: stop moving if no target
-        self.velocity.x = 0
-        self.velocity.y = 0
+        self:randomWander(dt)
     end
 end
 
--- UPDATED: Chase logic now uses the inherited `:move()` method for proper physics.
-function Enemy:chase(target, dt)
+-- Random wandering when no target
+function Enemy:randomWander(dt)
+    -- Occasionally change direction
+    if love.math.random() < 0.01 then
+        self.wanderDirection = {
+            x = love.math.random(-1, 1),
+            y = love.math.random(-1, 1)
+        }
+    end
+
+    if self.wanderDirection then
+        self:move(self.wanderDirection.x, self.wanderDirection.y)
+    end
+end
+
+-- Chase logic
+function Enemy:chase(target, dt, distance)
     local dx = target.x - self.x
     local dy = target.y - self.y
-    local distance = math.sqrt(dx*dx + dy*dy)
 
     if distance > 0 then
         -- Normalize direction vector
         dx = dx / distance
         dy = dy / distance
 
-        -- Use the parent's move method to set velocity.
-        -- The BaseCharacter:update() will handle the movement with collision.
+        -- Use the parent's move method
         self:move(dx, dy)
 
         -- Check if we're in range to attack
@@ -78,39 +125,90 @@ function Enemy:chase(target, dt)
     end
 end
 
--- Simple attack function.
+-- Attack function with network event
 function Enemy:attack(target)
     if target.takeDamage then
         target:takeDamage(self.damage)
         print(self.name .. " attacks " .. target.name .. " for " .. self.damage .. " damage!")
+
+        -- Create attack effect/visual
+        self:createAttackEffect(target)
     end
 end
 
--- Helper to calculate distance to another object.
-function Enemy:distanceTo(other)
-    local dx = other.x - self.x
-    local dy = other.y - self.y
-    return math.sqrt(dx*dx + dy*dy)
+-- Create visual attack effect
+function Enemy:createAttackEffect(target)
+    -- This can be expanded with particles or animations
+    local effect = {
+        type = "attack",
+        attackerId = self.enemyId,
+        targetId = target.name,
+        damage = self.damage,
+        x = target.x,
+        y = target.y
+    }
+
+    -- In a networked game, this effect would be broadcast to all clients
+    return effect
 end
 
--- NETWORKING: Creates state snapshot for the enemy (similar to Player).
+-- Draw enemy with special effects
+function Enemy:draw()
+    -- Draw shadow
+    love.graphics.setColor(0, 0, 0, 0.3)
+    love.graphics.rectangle('fill', self.x + 3, self.y + 5, self.width, self.height)
+
+    -- Draw main body
+    love.graphics.setColor(self.color)
+    love.graphics.rectangle('fill', self.x, self.y, self.width, self.height)
+
+    -- Draw enemy eyes
+    love.graphics.setColor(1, 1, 1)
+    local eyeSize = math.max(4, self.width / 8)
+    love.graphics.rectangle('fill', self.x + self.width/4, self.y + self.height/3, eyeSize, eyeSize)
+    love.graphics.rectangle('fill', self.x + self.width*3/4 - eyeSize, self.y + self.height/3, eyeSize, eyeSize)
+
+    -- Draw attack cooldown indicator
+    if self.attackTimer > 0 then
+        local cooldownPercent = self.attackTimer / self.attackCooldown
+        love.graphics.setColor(1, 1 - cooldownPercent, 0, 0.5)
+        love.graphics.rectangle('fill', self.x, self.y - 10, self.width * cooldownPercent, 3)
+    end
+
+    love.graphics.setColor(1, 1, 1)
+end
+
+-- NETWORKING: Creates state snapshot for the enemy
 function Enemy:getNetworkState()
     return {
-        x = math.floor(self.x),
-        y = math.floor(self.y),
+        id = self.enemyId,
+        x = math.floor(self.x + self.width/2),   -- Center X
+        y = math.floor(self.y + self.height/2),  -- Center Y
         health = self.health,
         type = self.type,
         alive = self.isAlive and 1 or 0
     }
 end
 
--- NETWORKING: Applies network state to the enemy.
+-- NETWORKING: Applies network state to the enemy
 function Enemy:applyNetworkState(state)
-    self.x = state.x
-    self.y = state.y
-    self.health = state.health
-    -- Note: 'type' generally shouldn't change after creation
-    self.isAlive = (state.alive == 1)
+    if state.x and state.y then
+        -- Convert center to top-left
+        self.x = state.x - self.width/2
+        self.y = state.y - self.height/2
+    end
+    self.health = state.health or self.health
+    self.isAlive = (state.alive == 1) or state.alive == true
+end
+
+-- Take damage with death notification
+function Enemy:takeDamage(amount)
+    BaseCharacter.takeDamage(self, amount)
+
+    if not self.isAlive then
+        -- Enemy died - could trigger death effect/score here
+        print(self.name .. " has been defeated!")
+    end
 end
 
 return Enemy

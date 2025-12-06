@@ -17,6 +17,12 @@ local Network = {
     hostUpdateInterval = 0.033  -- Server-only: send host updates ~30 times/sec
 }
 
+-- Contains Networking for enemies
+Network.enemies = {}              -- Server-only: track all enemies
+Network.lastEnemySpawnTime = 0    -- Server-only: track enemy spawning
+Network.enemySpawnInterval = 5.0  -- Seconds between enemy spawns
+Network.maxEnemies = 10           -- Maximum enemies in arena
+
 -- Private variables for network connections
 local server, client
 
@@ -27,8 +33,8 @@ local function getSerializablePlayers()
 
     -- Include host player if exists
     if Network.isServer and Network.hostPlayerData then
-        playersData["host"] = {
-            id = "host",
+        playersData["Host"] = {  -- Capital H
+            id = "Host",
             x = Network.hostPlayerData.x,
             y = Network.hostPlayerData.y,
             health = Network.hostPlayerData.health
@@ -56,7 +62,7 @@ local function broadcastHostUpdate()
     -- Send host update to all connected clients
     for id, player in pairs(Network.connectedPlayers) do
         player.client:send("playerUpdated", {
-            id = "host",
+            id = "Host",  -- Capital H
             x = Network.hostPlayerData.x,
             y = Network.hostPlayerData.y,
             health = Network.hostPlayerData.health
@@ -87,6 +93,14 @@ function Network.init(host, port, serverMode)
 
         server:on("playerUpdate", function(data, clientObj)
             Network.onPlayerUpdate(data, clientObj)
+        end)
+
+        server:on("enemyUpdate", function(data, clientObj)
+            Network.onEnemyUpdate(data, clientObj)
+        end)
+
+        server:on("playerAction", function(data, clientObj)
+            Network.onPlayerAction(data, clientObj)
         end)
 
         server:on("disconnect", function(data, clientObj)
@@ -138,6 +152,30 @@ function Network.init(host, port, serverMode)
             end
         end)
 
+        client:on("enemySpawned", function(data)
+            if Network.onEnemySpawnedCallback then
+                Network.onEnemySpawnedCallback(data)
+            end
+        end)
+
+        client:on("enemyUpdated", function(data)
+            if Network.onEnemyUpdatedCallback then
+                Network.onEnemyUpdatedCallback(data)
+            end
+        end)
+
+        client:on("enemyDied", function(data)
+            if Network.onEnemyDiedCallback then
+                Network.onEnemyDiedCallback(data)
+            end
+        end)
+
+        client:on("playerAction", function(data)
+            if Network.onPlayerActionCallback then
+                Network.onPlayerActionCallback(data)
+            end
+        end)
+
         client:on("disconnect", function(data)
             if Network.onDisconnectCallback then
                 Network.onDisconnectCallback(data)
@@ -157,6 +195,7 @@ end
 function Network.update(dt)
     if Network.isServer and server then
         server:update()
+        Network.updateEnemies(dt)  -- Update enemy AI
 
         -- Periodically broadcast host updates to all clients
         local currentTime = love.timer.getTime()
@@ -330,6 +369,176 @@ function Network.onPlayerUpdate(data, clientObj)
     end
 end
 
+-- PLAYER ACTION HANDLING
+-- ======================
+
+function Network.onPlayerAction(data, clientObj)
+    if not data or not data.action then return end
+
+    local clientId = tostring(clientObj:getIndex())
+
+    -- If the action is from the host, use "Host" as playerId
+    local senderPlayerId = clientId
+    if data.playerId == "Host" or data.playerId == "host" then
+        senderPlayerId = "Host"
+    end
+
+    -- Broadcast action to all other clients
+    for id, player in pairs(Network.connectedPlayers) do
+        if id ~= clientId then
+            player.client:send("playerAction", {
+                playerId = senderPlayerId,  -- Use consistent player ID
+                action = data.action,
+                x = data.x,
+                y = data.y,
+                direction = data.direction,
+                targetId = data.targetId,
+                targetX = data.targetX,
+                targetY = data.targetY
+            })
+        end
+    end
+
+    -- Also notify the host about this action (if it came from a client)
+    if Network.onPlayerActionCallback then
+        Network.onPlayerActionCallback({
+            playerId = senderPlayerId,  -- Use consistent player ID
+            action = data.action,
+            x = data.x,
+            y = data.y,
+            direction = data.direction,
+            targetId = data.targetId,
+            targetX = data.targetX,
+            targetY = data.targetY
+        })
+    end
+end
+
+function Network.sendPlayerAction(actionData) -- Client function to send actions
+    if client and client:isConnected() then
+        client:send("playerAction", actionData)
+    end
+end
+
+-- ENEMY MANAGEMENT FUNCTIONS
+-- ==========================
+
+function Network.spawnEnemy()
+    if not Network.isServer or not server then return end
+
+    -- Check if we should spawn more enemies
+    if #Network.enemies >= Network.maxEnemies then
+        return
+    end
+
+    local currentTime = love.timer.getTime()
+    if currentTime - Network.lastEnemySpawnTime < Network.enemySpawnInterval then
+        return
+    end
+
+    -- Spawn enemy at random location
+    local spawnX, spawnY = World.findSpawnLocation()
+    local enemyTypes = {"melee", "ranged", "boss"}
+    local enemyType = enemyTypes[love.math.random(1, #enemyTypes)]
+
+    local enemyId = tostring(love.math.random(10000, 99999))
+    local enemyData = {
+        id = enemyId,
+        x = spawnX,
+        y = spawnY,
+        type = enemyType,
+        health = enemyType == "boss" and 300 or 100
+    }
+
+    -- Store enemy
+    Network.enemies[enemyId] = enemyData
+
+    -- Broadcast to all clients
+    for _, player in pairs(Network.connectedPlayers) do
+        player.client:send("enemySpawned", enemyData)
+    end
+
+    -- Notify host
+    if Network.onEnemySpawnedCallback then
+        Network.onEnemySpawnedCallback(enemyData)
+    end
+
+    Network.lastEnemySpawnTime = currentTime
+    print("Server: Spawned enemy", enemyId, "type:", enemyType)
+end
+
+function Network.updateEnemies(dt)
+    if not Network.isServer then return end
+
+    -- Spawn enemies periodically
+    Network.spawnEnemy()
+
+    -- Update existing enemies (simple AI)
+    for enemyId, enemy in pairs(Network.enemies) do
+        -- Find nearest player to chase
+        local nearestPlayer = nil
+        local nearestDistance = math.huge
+
+        -- Check host player
+        if Network.hostPlayerData then
+            local dx = enemy.x - Network.hostPlayerData.x
+            local dy = enemy.y - Network.hostPlayerData.y
+            local distance = math.sqrt(dx*dx + dy*dy)
+            if distance < nearestDistance then
+                nearestDistance = distance
+                nearestPlayer = Network.hostPlayerData
+            end
+        end
+
+        -- Check connected clients
+        for _, player in pairs(Network.connectedPlayers) do
+            local dx = enemy.x - player.x
+            local dy = enemy.y - player.y
+            local distance = math.sqrt(dx*dx + dy*dy)
+            if distance < nearestDistance then
+                nearestDistance = distance
+                nearestPlayer = player
+            end
+        end
+
+        -- Move enemy toward nearest player
+        if nearestPlayer and nearestDistance > 50 then
+            local dx = nearestPlayer.x - enemy.x
+            local dy = nearestPlayer.y - enemy.y
+            local dist = math.sqrt(dx*dx + dy*dy)
+
+            if dist > 0 then
+                local speed = enemy.type == "boss" and 80 or
+                             enemy.type == "ranged" and 100 or 120
+                enemy.x = enemy.x + (dx/dist) * speed * dt
+                enemy.y = enemy.y + (dy/dist) * speed * dt
+
+                -- Broadcast update to all clients
+                for _, player in pairs(Network.connectedPlayers) do
+                    player.client:send("enemyUpdated", {
+                        id = enemyId,
+                        x = math.floor(enemy.x),
+                        y = math.floor(enemy.y),
+                        health = enemy.health
+                    })
+                end
+
+                -- Notify host
+                if Network.onEnemyUpdatedCallback then
+                    Network.onEnemyUpdatedCallback({
+                        id = enemyId,
+                        x = math.floor(enemy.x),
+                        y = math.floor(enemy.y),
+                        health = enemy.health
+                    })
+                end
+            end
+        end
+    end
+end
+
+
+
 -- CLIENT EVENT HANDLERS
 -- =====================
 
@@ -386,6 +595,22 @@ end
 
 function Network.setPlayerCorrectedCallback(callback)
     Network.onPlayerCorrectedCallback = callback
+end
+
+function Network.setEnemySpawnedCallback(callback)
+    Network.onEnemySpawnedCallback = callback
+end
+
+function Network.setEnemyUpdatedCallback(callback)
+    Network.onEnemyUpdatedCallback = callback
+end
+
+function Network.setEnemyDiedCallback(callback)
+    Network.onEnemyDiedCallback = callback
+end
+
+function Network.setPlayerActionCallback(callback)
+    Network.onPlayerActionCallback = callback
 end
 
 function Network.setHostCreatedCallback(callback)
