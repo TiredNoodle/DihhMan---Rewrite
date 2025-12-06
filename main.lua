@@ -14,7 +14,7 @@ local gameState = "menu"          -- "menu", "connecting", or "playing"
 local localPlayer = nil           -- The player controlled by this instance
 local remotePlayers = {}          -- Table of other players connected
 local myPlayerId = nil            -- Our assigned player ID from server
-local enemies = {} 							 	-- Table of active enemies
+local enemies = {}                -- Table of active enemies
 local mainMenu = nil              -- Main menu UI instance
 local debugFont = nil             -- Font for debug information display
 local showDebugInfo = true        -- Toggles debug overlay (set to TRUE for debugging)
@@ -95,6 +95,17 @@ function setupNetworkCallbacks()
             print("WARNING: No players data in game state!")
         end
 
+        -- NEW: CREATE ENEMIES FROM INITIAL GAME STATE
+        if data.enemies then
+            print("Creating enemies from initial game state:", tableCount(data.enemies))
+            for enemyId, enemyData in pairs(data.enemies) do
+                print("Creating enemy from game state:", enemyId, "at", enemyData.x, enemyData.y)
+                createEnemy(enemyId, enemyData)
+            end
+        else
+            print("No enemies in initial game state")
+        end
+
         -- CRITICAL FIX: Switch to playing state after receiving game state
         switchGameState("playing")
     end)
@@ -137,24 +148,26 @@ function setupNetworkCallbacks()
         end
     end)
 
-		-- Enemy related stuff
-		Network.setEnemySpawnedCallback(function(data)
-		    print("Enemy spawned:", data.id, "type:", data.type)
-		    createEnemy(data.id, data)
-		end)
+                -- Enemy related stuff
+                Network.setEnemySpawnedCallback(function(data)
+                    print("Enemy spawned:", data.id, "type:", data.type)
+                    createEnemy(data.id, data)
+                end)
 
-		Network.setEnemyUpdatedCallback(function(data)
-		    if enemies[data.id] then
-		        enemies[data.id]:applyNetworkState(data)
-		    end
-		end)
+                Network.setEnemyUpdatedCallback(function(data)
+                    if enemies[data.id] then
+                        enemies[data.id]:applyNetworkState(data)
+                    else
+                        print("WARNING: Received update for unknown enemy:", data.id)
+                    end
+                end)
 
-		Network.setEnemyDiedCallback(function(data)
-		    print("Enemy died:", data.id)
-		    if enemies[data.id] then
-		        enemies[data.id] = nil
-		    end
-		end)
+                Network.setEnemyDiedCallback(function(data)
+                    print("Enemy died:", data.id)
+                    if enemies[data.id] then
+                        enemies[data.id] = nil
+                    end
+                end)
 
     -- Called when a player successfully performs an action
     Network.setPlayerActionCallback(function(data)
@@ -164,11 +177,27 @@ function setupNetworkCallbacks()
             playerId = "Host"
         end
 
-        -- Apply action effect to remote player
-        if remotePlayers[playerId] then
+        -- FIXED: Handle host player action - host is always "Host" with capital H
+        if playerId == "Host" then
+            -- For host actions, we need to check if we're the host or a client
+            if Network.isServer then
+                -- We ARE the host, so apply to localPlayer
+                if localPlayer and localPlayer.name == "Host" then
+                    localPlayer:applyActionEffect(data)
+                end
+            else
+                -- We're a client, so host is a remote player
+                if remotePlayers["Host"] then
+                    remotePlayers["Host"]:applyActionEffect(data)
+                else
+                    print("WARNING: Received action for host but no host player found")
+                end
+            end
+        elseif remotePlayers[playerId] then
+            -- Apply action effect to remote player
             remotePlayers[playerId]:applyActionEffect(data)
         elseif playerId == myPlayerId and localPlayer then
-            -- If this action is for our local player
+            -- If this action is for our local player (client)
             localPlayer:applyActionEffect(data)
         else
             print("WARNING: Received action for unknown player:", data.playerId)
@@ -286,6 +315,7 @@ function cleanupGame()
     localPlayer = nil
     remotePlayers = {}
     myPlayerId = nil
+    enemies = {}  -- Clear enemies too!
     BaseCharacter.all = {}
 
     -- Clean up network connections
@@ -306,8 +336,8 @@ function love.update(dt)
 
     -- DEBUG: Log state every 60 frames (1 second at 60fps)
     if frameCount % 60 == 0 and gameState == "playing" then
-        print(string.format("Frame %d: State=%s, LocalPlayer=%s, RemotePlayers=%d",
-              frameCount, gameState, tostring(localPlayer ~= nil), tableCount(remotePlayers)))
+        print(string.format("Frame %d: State=%s, LocalPlayer=%s, RemotePlayers=%d, Enemies=%d",
+              frameCount, gameState, tostring(localPlayer ~= nil), tableCount(remotePlayers), tableCount(enemies)))
     end
 
     if gameState == "menu" then
@@ -325,8 +355,8 @@ function love.update(dt)
                 Network.sendPlayerState(localPlayer:getNetworkState())
             elseif Network.isServer then
                 -- Host: update our data in the Network module for new clients
-								local currentState = localPlayer:getNetworkState()
-		            Network.setHostPlayerData(currentState)
+                                                                local currentState = localPlayer:getNetworkState()
+                            Network.setHostPlayerData(currentState)
             end
         end
 
@@ -337,7 +367,7 @@ function love.update(dt)
             end
         end
 
-				-- Update enemies
+                                -- Update enemies
         for id, enemy in pairs(enemies) do
             if enemy then
                 -- Get all players for enemy AI
@@ -374,12 +404,12 @@ function love.draw()
         love.graphics.setColor(1, 1, 1)
         love.graphics.print("Connecting to server...", 350, 300)
     elseif gameState == "playing" then
-			-- Draw enemies first (background)
-			for id, enemy in pairs(enemies) do
-					if enemy then
-							enemy:draw()
-					end
-			end
+                        -- Draw enemies first (background)
+                        for id, enemy in pairs(enemies) do
+                                        if enemy then
+                                                        enemy:draw()
+                                        end
+                        end
 
         -- DEBUG: Draw coordinate grid for troubleshooting
         drawDebugGrid()
@@ -456,10 +486,10 @@ function drawGameUI()
     love.graphics.print("Connected: " .. (Network.isConnected() and "YES" or "NO"), 10, 50)
     love.graphics.print("My ID: " .. (myPlayerId or "none"), 10, 70)
     love.graphics.print("Remote Players: " .. tableCount(remotePlayers), 10, 90)
-    love.graphics.print("Enemies: " .. tableCount(enemies), 10, 350)
+    love.graphics.print("Enemies: " .. tableCount(enemies), 10, 110)
 
     if localPlayer then
-        love.graphics.print("Local Pos: " .. math.floor(localPlayer.x) .. "," .. math.floor(localPlayer.y), 10, 110)
+        love.graphics.print("Local Pos: " .. math.floor(localPlayer.x) .. "," .. math.floor(localPlayer.y), 10, 130)
     end
 end
 
@@ -491,6 +521,8 @@ function drawDebugInfo()
     end
 
     love.graphics.print("Remote Players: " .. tableCount(remotePlayers), 555, yPos)
+    yPos = yPos + 20
+    love.graphics.print("Enemies: " .. tableCount(enemies), 555, yPos)
     yPos = yPos + 20
 
     -- Show remote player positions
@@ -563,6 +595,7 @@ function love.keypressed(key)
             print("=== Render Info ===")
             print("Local player exists:", localPlayer ~= nil)
             print("Remote player count:", tableCount(remotePlayers))
+            print("Enemy count:", tableCount(enemies))
             print("Screen size: 800x600")
             print("Game State:", gameState)
         end

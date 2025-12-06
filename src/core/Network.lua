@@ -53,6 +53,22 @@ local function getSerializablePlayers()
     return playersData
 end
 
+-- Get serializable enemy data for new clients
+-- @return: Table containing all enemy data
+local function getSerializableEnemies()
+    local enemiesData = {}
+    for enemyId, enemy in pairs(Network.enemies) do
+        enemiesData[enemyId] = {
+            id = enemyId,
+            x = enemy.x,
+            y = enemy.y,
+            type = enemy.type,
+            health = enemy.health
+        }
+    end
+    return enemiesData
+end
+
 -- Broadcast host position updates to all connected clients
 local function broadcastHostUpdate()
     if not Network.isServer or not server or not Network.hostPlayerData then
@@ -233,10 +249,13 @@ function Network.onClientConnected(clientObj, data)
 
     -- Get serializable player data (without client objects)
     local playersData = getSerializablePlayers()
+    -- Get all current enemies
+    local enemiesData = getSerializableEnemies()
 
-    -- Send complete game state to the new client (only serializable data!)
+    -- Send complete game state to the new client (including enemies!)
     clientObj:send("gameState", {
         players = playersData,
+        enemies = enemiesData,  -- ADDED: Send all current enemies
         yourId = clientId
     })
 
@@ -383,6 +402,73 @@ function Network.onPlayerAction(data, clientObj)
         senderPlayerId = "Host"
     end
 
+    -- SERVER-SIDE DAMAGE PROCESSING
+    -- Check if this is an attack action and process damage
+    if (data.action == "attack" or data.action == "special") and data.x and data.y then
+        -- Determine damage and range based on action type
+        local damageAmount = (data.action == "special") and 40 or 20
+        local attackRange = (data.action == "special") and 100 or 60
+
+        -- Find the closest enemy to the attack position
+        local closestEnemy = nil
+        local closestDistance = attackRange
+
+        for enemyId, enemy in pairs(Network.enemies) do
+            local dx = enemy.x - data.x
+            local dy = enemy.y - data.y
+            local distance = math.sqrt(dx*dx + dy*dy)
+
+            if distance < closestDistance then
+                closestDistance = distance
+                closestEnemy = {id = enemyId, data = enemy}
+            end
+        end
+
+        -- If an enemy is in range, apply damage
+        if closestEnemy then
+            closestEnemy.data.health = closestEnemy.data.health - damageAmount
+            print(string.format("Server: Player %s dealt %d damage to enemy %s (health: %d)",
+                  senderPlayerId, damageAmount, closestEnemy.id, closestEnemy.data.health))
+
+            -- Check if enemy died
+            if closestEnemy.data.health <= 0 then
+                -- Broadcast enemy death
+                for id, player in pairs(Network.connectedPlayers) do
+                    player.client:send("enemyDied", {id = closestEnemy.id})
+                end
+
+                -- Notify host via callback
+                if Network.onEnemyDiedCallback then
+                    Network.onEnemyDiedCallback({id = closestEnemy.id})
+                end
+
+                -- Remove from server tracking
+                Network.enemies[closestEnemy.id] = nil
+                print("Server: Enemy", closestEnemy.id, "has been defeated")
+            else
+                -- Broadcast enemy health update
+                for id, player in pairs(Network.connectedPlayers) do
+                    player.client:send("enemyUpdated", {
+                        id = closestEnemy.id,
+                        x = closestEnemy.data.x,
+                        y = closestEnemy.data.y,
+                        health = closestEnemy.data.health
+                    })
+                end
+
+                -- Notify host via callback
+                if Network.onEnemyUpdatedCallback then
+                    Network.onEnemyUpdatedCallback({
+                        id = closestEnemy.id,
+                        x = closestEnemy.data.x,
+                        y = closestEnemy.data.y,
+                        health = closestEnemy.data.health
+                    })
+                end
+            end
+        end
+    end
+
     -- Broadcast action to all other clients
     for id, player in pairs(Network.connectedPlayers) do
         if id ~= clientId then
@@ -427,7 +513,10 @@ function Network.spawnEnemy()
     if not Network.isServer or not server then return end
 
     -- Check if we should spawn more enemies
-    if #Network.enemies >= Network.maxEnemies then
+    local enemyCount = 0
+    for _ in pairs(Network.enemies) do enemyCount = enemyCount + 1 end
+
+    if enemyCount >= Network.maxEnemies then
         return
     end
 
@@ -536,8 +625,6 @@ function Network.updateEnemies(dt)
         end
     end
 end
-
-
 
 -- CLIENT EVENT HANDLERS
 -- =====================
@@ -660,6 +747,11 @@ function Network.printDebugInfo()
             print(string.format("  Host at (%d, %d)",
                   Network.hostPlayerData.x, Network.hostPlayerData.y))
         end
+
+        -- Show enemy count
+        local enemyCount = 0
+        for _ in pairs(Network.enemies) do enemyCount = enemyCount + 1 end
+        print("Active enemies:", enemyCount)
     end
 end
 

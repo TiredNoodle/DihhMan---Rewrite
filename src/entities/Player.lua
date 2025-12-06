@@ -73,6 +73,9 @@ function Player:handleInput(dt)
         dy = dy * 0.7071
     end
 
+    -- Store movement direction for actions
+    self.lastMoveDirection = {x = dx, y = dy}
+
     -- Set the velocity
     self:move(dx, dy)
 
@@ -114,32 +117,26 @@ function Player:performAction(actionName)
     self.actionStartTime = love.timer.getTime()
     action.timer = action.cooldown
 
-    -- Find target for attack actions
-    local targetId, targetX, targetY = nil, nil, nil
-    if actionName == 'attack' or actionName == 'special' then
-        self:findActionTarget()
-        if self.actionTarget then
-            targetId = self.actionTarget.name
-            targetX = self.actionTarget.x
-            targetY = self.actionTarget.y
-        end
+    -- Calculate attack direction based on last movement or default
+    local attackDirection = {x = 0, y = 0}
+    if self.lastMoveDirection then
+        attackDirection = self.lastMoveDirection
+    elseif self.velocity.x ~= 0 or self.velocity.y ~= 0 then
+        -- Normalize velocity for direction
+        local length = math.sqrt(self.velocity.x^2 + self.velocity.y^2)
+        attackDirection = {x = self.velocity.x/length, y = self.velocity.y/length}
+    else
+        attackDirection = {x = 0, y = -1} -- Default: attack forward (up)
     end
 
-    -- Handle dash action
-    if actionName == 'dash' then
-        self:performDash()
-    end
-
-    -- Create action effect
+    -- Create action data to send to server
+    -- The server will handle finding targets and applying damage
     local actionData = {
         playerId = self.name,
         action = actionName,
-        x = self.x + self.width/2,
-        y = self.y + self.height/2,
-        direction = {x = self.velocity.x, y = self.velocity.y},
-        targetId = targetId,
-        targetX = targetX,
-        targetY = targetY,
+        x = self.x + self.width/2,  -- Center position
+        y = self.y + self.height/2, -- Center position
+        direction = attackDirection, -- Direction of attack
         timestamp = love.timer.getTime()
     }
 
@@ -148,72 +145,29 @@ function Player:performAction(actionName)
         Network.sendPlayerAction(actionData)
     end
 
-    -- If we're the host, broadcast to all clients AND trigger locally
+    -- If we're the host, send to our own server for processing
     if self.isLocalPlayer and Network and Network.isServer then
-        -- Broadcast to all connected clients
-        for id, player in pairs(Network.connectedPlayers) do
-            player.client:send("playerAction", actionData)
-        end
         -- Host triggers its own effect locally
-        self:triggerActionEffect(actionName, targetId, targetX, targetY)
+        self:triggerActionEffect(actionName, nil, nil, nil)
+
+        -- Also process the action through server logic (this will handle damage)
+        -- We need to simulate receiving the action as if from a client
+        Network.onPlayerAction(actionData, {getIndex = function() return "host" end})
     elseif self.isLocalPlayer and Network and not Network.isServer then
-        -- Client triggers local effect
-        self:triggerActionEffect(actionName, targetId, targetX, targetY)
+        -- Client triggers local effect (visual only)
+        self:triggerActionEffect(actionName, nil, nil, nil)
     end
 
     return actionData
 end
 
-function Player:findActionTarget()
-    -- Get all potential targets (enemies, other players)
-    local allTargets = {}
-
-    -- Add enemies
-    for _, enemy in ipairs(BaseCharacter.getAllAlive() or {}) do
-        if enemy.class and enemy.class.name == 'Enemy' then
-            table.insert(allTargets, enemy)
-        end
-    end
-
-    -- Find closest target in range
-    local action = self.actions[self.currentAction]
-    local closestTarget = nil
-    local closestDistance = math.huge
-
-    for _, target in ipairs(allTargets) do
-        local distance = self:distanceTo(target)
-        if distance <= action.range and distance < closestDistance then
-            closestDistance = distance
-            closestTarget = target
-        end
-    end
-
-    self.actionTarget = closestTarget
-end
-
+-- Simplified: Just triggers visual effects, damage is handled by server
 function Player:completeAction()
     if not self.currentAction then return end
-
-    -- Apply damage if attack action
-    if self.currentAction == 'attack' or self.currentAction == 'special' then
-        if self.actionTarget then
-            self:applyActionDamage()
-        end
-    end
 
     -- Clear action state
     self.currentAction = nil
     self.actionTarget = nil
-end
-
-function Player:applyActionDamage()
-    if not self.actionTarget then return end
-
-    local action = self.actions[self.currentAction]
-    self.actionTarget:takeDamage(action.damage)
-
-    print(string.format("%s hits %s for %d damage!",
-          self.name, self.actionTarget.name, action.damage))
 end
 
 function Player:performDash()
@@ -239,29 +193,11 @@ function Player:performDash()
     self.collisionEnabled = oldCollision
 end
 
--- Action effect system
+-- Action effect system - visual only
 function Player:triggerActionEffect(actionName, targetId, targetX, targetY)
-    -- Set up the action state
+    -- Set up the action state for visual feedback
     self.currentAction = actionName
     self.actionStartTime = love.timer.getTime()
-
-    -- Find target if provided
-    if targetId and actionName ~= "dash" then
-        -- Look for the target among enemies or other players
-        local allTargets = {}
-        for _, enemy in ipairs(BaseCharacter.getAllAlive() or {}) do
-            if enemy.class and enemy.class.name == 'Enemy' then
-                table.insert(allTargets, enemy)
-            end
-        end
-
-        for _, enemy in ipairs(allTargets) do
-            if enemy.name == targetId then
-                self.actionTarget = enemy
-                break
-            end
-        end
-    end
 
     -- Create visual effects based on action type
     if actionName == "attack" then
@@ -323,7 +259,7 @@ function Player:updateActionEffects(dt)
     end
 end
 
--- Apply action effect from network
+-- Apply action effect from network (visual only)
 function Player:applyActionEffect(effectData)
     -- Trigger the visual effect for this player
     if effectData.action and effectData.playerId == self.name then

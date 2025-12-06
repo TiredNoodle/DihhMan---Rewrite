@@ -38,6 +38,9 @@ function Enemy:initialize(name, x, y, enemyType)
         self.speed = 120
     end
 
+    -- Store original color for health display
+    self.originalColor = {self.color[1], self.color[2], self.color[3]}
+
     print(string.format("Enemy '%s' (%s) created at (%d, %d)",
           self.name, self.type, x, y))
 end
@@ -63,7 +66,7 @@ function Enemy:findTarget(players)
     return closestPlayer, closestDistance
 end
 
--- UPDATED: AI behavior with network synchronization
+-- UPDATED: Main update loop. Applies velocity and resolves world collisions.
 function Enemy:update(dt, players)
     -- 1. Update base movement and collision
     BaseCharacter.update(self, dt)
@@ -158,8 +161,12 @@ function Enemy:draw()
     love.graphics.setColor(0, 0, 0, 0.3)
     love.graphics.rectangle('fill', self.x + 3, self.y + 5, self.width, self.height)
 
-    -- Draw main body
-    love.graphics.setColor(self.color)
+    -- Draw main body with health-based color tint
+    local healthPercent = self.health / self.maxHealth
+    local r = self.originalColor[1] * (0.5 + 0.5 * healthPercent)
+    local g = self.originalColor[2] * (0.3 + 0.7 * healthPercent)
+    local b = self.originalColor[3] * (0.3 + 0.7 * healthPercent)
+    love.graphics.setColor(r, g, b)
     love.graphics.rectangle('fill', self.x, self.y, self.width, self.height)
 
     -- Draw enemy eyes
@@ -175,6 +182,38 @@ function Enemy:draw()
         love.graphics.rectangle('fill', self.x, self.y - 10, self.width * cooldownPercent, 3)
     end
 
+    -- Draw health bar (always visible for enemies)
+    self:drawHealthBar()
+
+    love.graphics.setColor(1, 1, 1)
+end
+
+-- Override health bar to always show for enemies
+function Enemy:drawHealthBar()
+    local barWidth = 50
+    local barHeight = 6
+    local x = self.x + self.width/2 - barWidth/2
+    local y = self.y - 15
+
+    -- Background
+    love.graphics.setColor(0.2, 0.2, 0.2)
+    love.graphics.rectangle('fill', x, y, barWidth, barHeight)
+
+    -- Health bar
+    local healthPercent = self.health / self.maxHealth
+    if healthPercent > 0.6 then
+        love.graphics.setColor(0, 1, 0)  -- Green
+    elseif healthPercent > 0.3 then
+        love.graphics.setColor(1, 1, 0)  -- Yellow
+    else
+        love.graphics.setColor(1, 0, 0)  -- Red
+    end
+    love.graphics.rectangle('fill', x, y, barWidth * healthPercent, barHeight)
+
+    -- Outline
+    love.graphics.setColor(0, 0, 0)
+    love.graphics.rectangle('line', x, y, barWidth, barHeight)
+
     love.graphics.setColor(1, 1, 1)
 end
 
@@ -185,6 +224,7 @@ function Enemy:getNetworkState()
         x = math.floor(self.x + self.width/2),   -- Center X
         y = math.floor(self.y + self.height/2),  -- Center Y
         health = self.health,
+        maxHealth = self.maxHealth,
         type = self.type,
         alive = self.isAlive and 1 or 0
     }
@@ -197,8 +237,18 @@ function Enemy:applyNetworkState(state)
         self.x = state.x - self.width/2
         self.y = state.y - self.height/2
     end
-    self.health = state.health or self.health
+    if state.health then
+        self.health = state.health
+    end
+    if state.maxHealth then
+        self.maxHealth = state.maxHealth
+    end
     self.isAlive = (state.alive == 1) or state.alive == true
+
+    -- Flash white when damaged
+    if state.health and state.health < self.health then
+        self.damageFlashTimer = 0.2
+    end
 end
 
 -- Take damage with death notification
