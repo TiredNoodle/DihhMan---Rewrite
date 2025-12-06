@@ -6,7 +6,7 @@ local Network = require "src.core.Network"
 local Player = BaseCharacter:subclass('Player')
 
 function Player:initialize(name, x, y)
-    -- FIRST, call the parent class's constructor
+    -- Call parent constructor first
     BaseCharacter.initialize(self, name, x, y)
 
     -- Player-specific properties
@@ -32,9 +32,13 @@ function Player:initialize(name, x, y)
     self.actionTarget = nil
     self.actionStartTime = 0
     self.actionDuration = 0.2
+
+    -- Effect timers
+    self.attackEffectTimer = nil
+    self.specialEffectTimer = nil
+    self.dashEffectTimer = nil
 end
 
--- UPDATED: Update with action cooldowns
 function Player:update(dt)
     -- Update action cooldowns
     for actionName, action in pairs(self.actions) do
@@ -43,13 +47,8 @@ function Player:update(dt)
         end
     end
 
-    -- Update current action
-    if self.currentAction then
-        local elapsed = love.timer.getTime() - self.actionStartTime
-        if elapsed >= self.actionDuration then
-            self:completeAction()
-        end
-    end
+    -- Update action effects
+    self:updateActionEffects(dt)
 
     if self.isLocalPlayer then
         self:handleInput(dt) -- Process keyboard input
@@ -60,7 +59,6 @@ function Player:update(dt)
     BaseCharacter.update(self, dt)
 end
 
--- Handle keyboard input for movement
 function Player:handleInput(dt)
     local dx, dy = 0, 0
 
@@ -85,7 +83,6 @@ function Player:handleInput(dt)
     end
 end
 
--- Handle action input
 function Player:handleActions()
     -- Attack action (Space)
     if love.keyboard.isDown('space') and self:canPerformAction('attack') then
@@ -103,25 +100,29 @@ function Player:handleActions()
     end
 end
 
--- Check if action can be performed
 function Player:canPerformAction(actionName)
     local action = self.actions[actionName]
     return action and action.timer <= 0 and not self.currentAction
 end
 
--- Perform an action
 function Player:performAction(actionName)
     local action = self.actions[actionName]
-    if not action then return end
+    if not action or not self:canPerformAction(actionName) then return end
 
-    -- Start the action
+    -- Start the action locally
     self.currentAction = actionName
     self.actionStartTime = love.timer.getTime()
     action.timer = action.cooldown
 
     -- Find target for attack actions
+    local targetId, targetX, targetY = nil, nil, nil
     if actionName == 'attack' or actionName == 'special' then
         self:findActionTarget()
+        if self.actionTarget then
+            targetId = self.actionTarget.name
+            targetX = self.actionTarget.x
+            targetY = self.actionTarget.y
+        end
     end
 
     -- Handle dash action
@@ -130,33 +131,39 @@ function Player:performAction(actionName)
     end
 
     -- Create action effect
-    local actionData = self:createActionEffect()
+    local actionData = {
+        playerId = self.name,
+        action = actionName,
+        x = self.x + self.width/2,
+        y = self.y + self.height/2,
+        direction = {x = self.velocity.x, y = self.velocity.y},
+        targetId = targetId,
+        targetX = targetX,
+        targetY = targetY,
+        timestamp = love.timer.getTime()
+    }
 
     -- Network: Send action to server if we're a client
-    if self.isLocalPlayer and not Network.isServer then
+    if self.isLocalPlayer and Network and not Network.isServer then
         Network.sendPlayerAction(actionData)
     end
 
-    print(self.name .. " performs " .. actionName .. " action!")
-end
-
--- Complete current action
-function Player:completeAction()
-    if not self.currentAction then return end
-
-    -- Apply damage if attack action
-    if self.currentAction == 'attack' or self.currentAction == 'special' then
-        if self.actionTarget then
-            self:applyActionDamage()
+    -- If we're the host, broadcast to all clients AND trigger locally
+    if self.isLocalPlayer and Network and Network.isServer then
+        -- Broadcast to all connected clients
+        for id, player in pairs(Network.connectedPlayers) do
+            player.client:send("playerAction", actionData)
         end
+        -- Host triggers its own effect locally
+        self:triggerActionEffect(actionName, targetId, targetX, targetY)
+    elseif self.isLocalPlayer and Network and not Network.isServer then
+        -- Client triggers local effect
+        self:triggerActionEffect(actionName, targetId, targetX, targetY)
     end
 
-    -- Clear action state
-    self.currentAction = nil
-    self.actionTarget = nil
+    return actionData
 end
 
--- Find target for attack actions
 function Player:findActionTarget()
     -- Get all potential targets (enemies, other players)
     local allTargets = {}
@@ -184,7 +191,21 @@ function Player:findActionTarget()
     self.actionTarget = closestTarget
 end
 
--- Apply damage to action target
+function Player:completeAction()
+    if not self.currentAction then return end
+
+    -- Apply damage if attack action
+    if self.currentAction == 'attack' or self.currentAction == 'special' then
+        if self.actionTarget then
+            self:applyActionDamage()
+        end
+    end
+
+    -- Clear action state
+    self.currentAction = nil
+    self.actionTarget = nil
+end
+
 function Player:applyActionDamage()
     if not self.actionTarget then return end
 
@@ -195,7 +216,6 @@ function Player:applyActionDamage()
           self.name, self.actionTarget.name, action.damage))
 end
 
--- Perform dash movement
 function Player:performDash()
     local action = self.actions.dash
 
@@ -219,30 +239,98 @@ function Player:performDash()
     self.collisionEnabled = oldCollision
 end
 
--- Create action effect data for networking
-function Player:createActionEffect()
-    local action = self.actions[self.currentAction]
+-- Action effect system
+function Player:triggerActionEffect(actionName, targetId, targetX, targetY)
+    -- Set up the action state
+    self.currentAction = actionName
+    self.actionStartTime = love.timer.getTime()
 
-    local effect = {
-        playerId = self.name,
-        action = self.currentAction,
-        x = self.x + self.width/2,
-        y = self.y + self.height/2,
-        direction = {x = self.velocity.x, y = self.velocity.y},
-        timestamp = love.timer.getTime()
-    }
+    -- Find target if provided
+    if targetId and actionName ~= "dash" then
+        -- Look for the target among enemies or other players
+        local allTargets = {}
+        for _, enemy in ipairs(BaseCharacter.getAllAlive() or {}) do
+            if enemy.class and enemy.class.name == 'Enemy' then
+                table.insert(allTargets, enemy)
+            end
+        end
 
-    -- Add target info if available
-    if self.actionTarget then
-        effect.targetId = self.actionTarget.name
-        effect.targetX = self.actionTarget.x
-        effect.targetY = self.actionTarget.y
+        for _, enemy in ipairs(allTargets) do
+            if enemy.name == targetId then
+                self.actionTarget = enemy
+                break
+            end
+        end
     end
 
-    return effect
+    -- Create visual effects based on action type
+    if actionName == "attack" then
+        self:showAttackEffect()
+    elseif actionName == "special" then
+        self:showSpecialEffect()
+    elseif actionName == "dash" then
+        self:showDashEffect()
+    end
+
+    print(self.name .. " performs " .. actionName .. " action!")
 end
 
--- Override draw to show action effects
+-- Visual effect methods
+function Player:showAttackEffect()
+    -- Create attack animation/particles
+    self.attackEffectTimer = 0.3  -- 300ms effect
+end
+
+function Player:showSpecialEffect()
+    -- Create special attack animation
+    self.specialEffectTimer = 0.5  -- 500ms effect
+end
+
+function Player:showDashEffect()
+    -- Create dash trail effect
+    self.dashEffectTimer = 0.4  -- 400ms effect
+end
+
+function Player:updateActionEffects(dt)
+    -- Update effect timers
+    if self.attackEffectTimer then
+        self.attackEffectTimer = self.attackEffectTimer - dt
+        if self.attackEffectTimer <= 0 then
+            self.attackEffectTimer = nil
+        end
+    end
+
+    if self.specialEffectTimer then
+        self.specialEffectTimer = self.specialEffectTimer - dt
+        if self.specialEffectTimer <= 0 then
+            self.specialEffectTimer = nil
+        end
+    end
+
+    if self.dashEffectTimer then
+        self.dashEffectTimer = self.dashEffectTimer - dt
+        if self.dashEffectTimer <= 0 then
+            self.dashEffectTimer = nil
+        end
+    end
+
+    -- Update current action timer
+    if self.currentAction then
+        local elapsed = love.timer.getTime() - self.actionStartTime
+        if elapsed >= self.actionDuration then
+            self:completeAction()
+        end
+    end
+end
+
+-- Apply action effect from network
+function Player:applyActionEffect(effectData)
+    -- Trigger the visual effect for this player
+    if effectData.action and effectData.playerId == self.name then
+        self:triggerActionEffect(effectData.action, effectData.targetId, effectData.targetX, effectData.targetY)
+    end
+end
+
 function Player:draw()
     -- Draw a shadow for depth
     love.graphics.setColor(0, 0, 0, 0.3)
@@ -251,6 +339,25 @@ function Player:draw()
     -- Draw the main body
     love.graphics.setColor(self.color)
     love.graphics.rectangle('fill', self.x, self.y, self.width, self.height)
+
+    -- Draw action effect overlays
+    if self.attackEffectTimer then
+        love.graphics.setColor(1, 0, 0, 0.5)  -- Red flash for attack
+        love.graphics.rectangle('fill', self.x - 5, self.y - 5, self.width + 10, self.height + 10)
+    end
+
+    if self.specialEffectTimer then
+        love.graphics.setColor(1, 1, 0, 0.5)  -- Yellow flash for special
+        love.graphics.rectangle('fill', self.x - 10, self.y - 10, self.width + 20, self.height + 20)
+    end
+
+    if self.dashEffectTimer then
+        love.graphics.setColor(0, 1, 1, 0.3)  -- Cyan trail for dash
+        -- Draw multiple rectangles behind for trail effect
+        for i = 1, 3 do
+            love.graphics.rectangle('fill', self.x - i*5, self.y - i*3, self.width, self.height)
+        end
+    end
 
     -- Draw action indicator
     if self.currentAction then
@@ -286,7 +393,6 @@ function Player:draw()
     love.graphics.setColor(1, 1, 1)
 end
 
--- NETWORKING: Creates a compact state snapshot to send over the network
 function Player:getNetworkState()
     return {
         x = math.floor(self.x + self.width/2),   -- Send CENTER X
@@ -301,7 +407,6 @@ function Player:getNetworkState()
     }
 end
 
--- NETWORKING: Applies a state snapshot received from the network
 function Player:applyNetworkState(state)
     -- Convert from center to top-left corner
     self.x = state.x - self.width/2
@@ -317,30 +422,6 @@ function Player:applyNetworkState(state)
             end
         end
     end
-end
-
--- Apply action effect from network
-function Player:applyActionEffect(effectData)
-    -- Visual effect for remote player actions
-    if effectData.action == 'attack' or effectData.action == 'special' then
-        self:showActionEffect(effectData)
-    elseif effectData.action == 'dash' then
-        self:showDashEffect(effectData)
-    end
-end
-
--- Show visual effect for action
-function Player:showActionEffect(effectData)
-    -- This would trigger particles/animations
-    -- For now, just log it
-    print(string.format("%s performs %s at (%d, %d)",
-          effectData.playerId, effectData.action, effectData.x, effectData.y))
-end
-
--- Show dash effect
-function Player:showDashEffect(effectData)
-    -- Visual trail effect for dash
-    print(string.format("%s dashes!", effectData.playerId))
 end
 
 return Player

@@ -33,8 +33,8 @@ local function getSerializablePlayers()
 
     -- Include host player if exists
     if Network.isServer and Network.hostPlayerData then
-        playersData["host"] = {
-            id = "host",
+        playersData["Host"] = {  -- Capital H
+            id = "Host",
             x = Network.hostPlayerData.x,
             y = Network.hostPlayerData.y,
             health = Network.hostPlayerData.health
@@ -62,7 +62,7 @@ local function broadcastHostUpdate()
     -- Send host update to all connected clients
     for id, player in pairs(Network.connectedPlayers) do
         player.client:send("playerUpdated", {
-            id = "host",
+            id = "Host",  -- Capital H
             x = Network.hostPlayerData.x,
             y = Network.hostPlayerData.y,
             health = Network.hostPlayerData.health
@@ -377,11 +377,17 @@ function Network.onPlayerAction(data, clientObj)
 
     local clientId = tostring(clientObj:getIndex())
 
+    -- If the action is from the host, use "Host" as playerId
+    local senderPlayerId = clientId
+    if data.playerId == "Host" or data.playerId == "host" then
+        senderPlayerId = "Host"
+    end
+
     -- Broadcast action to all other clients
     for id, player in pairs(Network.connectedPlayers) do
         if id ~= clientId then
             player.client:send("playerAction", {
-                playerId = clientId,
+                playerId = senderPlayerId,  -- Use consistent player ID
                 action = data.action,
                 x = data.x,
                 y = data.y,
@@ -393,10 +399,10 @@ function Network.onPlayerAction(data, clientObj)
         end
     end
 
-    -- Also notify host
+    -- Also notify the host about this action (if it came from a client)
     if Network.onPlayerActionCallback then
         Network.onPlayerActionCallback({
-            playerId = clientId,
+            playerId = senderPlayerId,  -- Use consistent player ID
             action = data.action,
             x = data.x,
             y = data.y,

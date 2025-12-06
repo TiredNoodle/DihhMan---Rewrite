@@ -156,13 +156,24 @@ function setupNetworkCallbacks()
 		    end
 		end)
 
-		-- Called when a player successfully performs an action
-		Network.setPlayerActionCallback(function(data)
-		    -- Apply action effect to remote player
-		    if remotePlayers[data.playerId] then
-		        remotePlayers[data.playerId]:applyActionEffect(data)
-		    end
-		end)
+    -- Called when a player successfully performs an action
+    Network.setPlayerActionCallback(function(data)
+        -- Normalize player ID
+        local playerId = data.playerId
+        if playerId == "host" then
+            playerId = "Host"
+        end
+
+        -- Apply action effect to remote player
+        if remotePlayers[playerId] then
+            remotePlayers[playerId]:applyActionEffect(data)
+        elseif playerId == myPlayerId and localPlayer then
+            -- If this action is for our local player
+            localPlayer:applyActionEffect(data)
+        else
+            print("WARNING: Received action for unknown player:", data.playerId)
+        end
+    end)
 
     -- Called when host successfully creates a game
     Network.setHostCreatedCallback(function()
@@ -211,6 +222,11 @@ function createLocalPlayer(name, x, y)
     localPlayer = Player:new(name, spawnX, spawnY)
     localPlayer.isLocalPlayer = true
 
+    -- Ensure host player has consistent name
+    if name == "Host" then
+        localPlayer.name = "Host"  -- Ensure uppercase H
+    end
+
     print(string.format("Local player '%s' created at (%d, %d)", name, spawnX, spawnY))
 end
 
@@ -218,16 +234,22 @@ end
 -- @param id: Unique network ID of the remote player
 -- @param data: Initial state data from server
 function createRemotePlayer(id, data)
+    -- Normalize host ID to "Host" (capital H)
+    local normalizedId = id
+    if id == "host" then
+        normalizedId = "Host"
+    end
+
     -- Check if player already exists
-    if remotePlayers[id] then
-        print("Remote player already exists:", id)
+    if remotePlayers[normalizedId] then
+        print("Remote player already exists:", normalizedId)
         return
     end
 
-    local player = NetworkPlayer:new(id, data.x, data.y)
+    local player = NetworkPlayer:new(normalizedId, data.x, data.y)
     player.health = data.health or 100
-    remotePlayers[id] = player
-    print(string.format("Remote player '%s' created at (%d, %d)", id, data.x, data.y))
+    remotePlayers[normalizedId] = player
+    print(string.format("Remote player '%s' created at (%d, %d)", normalizedId, data.x, data.y))
 end
 
 -- Creates a visual representation of a enemy
