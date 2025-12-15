@@ -1,5 +1,5 @@
 -- src/entities/Enemy.lua
--- AI-controlled enemy character with network synchronization
+-- AI-controlled enemy character with proper health bar fade
 local BaseCharacter = require "src.entities.BaseCharacter"
 
 local Enemy = BaseCharacter:subclass('Enemy')
@@ -12,37 +12,58 @@ function Enemy:initialize(name, x, y, enemyType)
     self.type = enemyType or "melee"
     self.damage = 10
     self.attackRange = 50
-    self.aggroRange = 300  -- Increased for open arena
-    self.attackCooldown = 1.5
+    self.aggroRange = 300
+    self.attackCooldown = 2.0  -- Increased to prevent spam
     self.attackTimer = 0
     self.targetPlayer = nil
-    self.enemyId = tostring(love.math.random(10000, 99999)) -- Unique ID for networking
+    self.enemyId = nil  -- Will be set from network data
 
     -- Type-specific property overrides
     if enemyType == "ranged" then
         self.color = {1, 0.5, 0}  -- Orange
         self.speed = 120
         self.aggroRange = 400
-        self.attackRange = 200  -- Ranged enemies attack from farther
+        self.attackRange = 200
+        self.maxHealth = 100
+        self.health = 100
+        self.attackCooldown = 2.5
+        self.width = 35
+        self.height = 35
     elseif enemyType == "boss" then
         self.color = {0.5, 0, 0.5}  -- Purple
         self.width = 80
         self.height = 80
-        self.health = 300
         self.maxHealth = 300
+        self.health = 300
         self.speed = 80
         self.damage = 25
         self.attackRange = 80
+        self.attackCooldown = 3.0
+    elseif enemyType == "sample_fast" then
+        self.color = {0, 1, 0.5}  -- Teal
+        self.speed = 180
+        self.width = 35
+        self.height = 35
+        self.maxHealth = 75
+        self.health = 75
+        self.damage = 15
+        self.attackRange = 40
+        self.attackCooldown = 1.5
+        self.aggroRange = 350
     else -- "melee" (default)
         self.color = {0.8, 0.2, 0.2}  -- Red
         self.speed = 120
+        self.maxHealth = 100
+        self.health = 100
+        self.width = 40
+        self.height = 40
     end
 
-    -- Store original color for health display
+    -- Store original color
     self.originalColor = {self.color[1], self.color[2], self.color[3]}
 
-    print(string.format("Enemy '%s' (%s) created at (%d, %d)",
-          self.name, self.type, x, y))
+    print(string.format("Enemy '%s' (%s) created at (%d, %d) Health: %d",
+          self.name, self.type, x, y, self.health))
 end
 
 -- Find closest player to target
@@ -51,7 +72,7 @@ function Enemy:findTarget(players)
     local closestDistance = math.huge
 
     for _, player in ipairs(players) do
-        if player.isAlive then
+        if player.isAlive and player.health > 0 then
             local dx = player.x - self.x
             local dy = player.y - self.y
             local distance = math.sqrt(dx*dx + dy*dy)
@@ -66,9 +87,12 @@ function Enemy:findTarget(players)
     return closestPlayer, closestDistance
 end
 
--- UPDATED: Main update loop. Applies velocity and resolves world collisions.
+-- Main update loop - CRITICAL: Calls BaseCharacter.update for health bar fade
 function Enemy:update(dt, players)
-    -- 1. Update base movement and collision
+    -- Only update if alive
+    if not self.isAlive then return end
+
+    -- 1. Update base movement, collision, and health bar fade
     BaseCharacter.update(self, dt)
 
     -- 2. Update internal cooldown timer
@@ -76,7 +100,7 @@ function Enemy:update(dt, players)
         self.attackTimer = self.attackTimer - dt
     end
 
-    -- 3. Find and chase target
+    -- 3. Find and chase target (only if game is active and we have players)
     if players and #players > 0 then
         local target, distance = self:findTarget(players)
 
@@ -128,7 +152,7 @@ function Enemy:chase(target, dt, distance)
     end
 end
 
--- Attack function with network event
+-- Attack function
 function Enemy:attack(target)
     if target.takeDamage then
         target:takeDamage(self.damage)
@@ -141,7 +165,6 @@ end
 
 -- Create visual attack effect
 function Enemy:createAttackEffect(target)
-    -- This can be expanded with particles or animations
     local effect = {
         type = "attack",
         attackerId = self.enemyId,
@@ -151,12 +174,15 @@ function Enemy:createAttackEffect(target)
         y = target.y
     }
 
-    -- In a networked game, this effect would be broadcast to all clients
     return effect
 end
 
 -- Draw enemy with special effects
 function Enemy:draw()
+    if not self.isAlive then
+        return  -- Don't draw dead enemies
+    end
+
     -- Draw shadow
     love.graphics.setColor(0, 0, 0, 0.3)
     love.graphics.rectangle('fill', self.x + 3, self.y + 5, self.width, self.height)
@@ -182,37 +208,8 @@ function Enemy:draw()
         love.graphics.rectangle('fill', self.x, self.y - 10, self.width * cooldownPercent, 3)
     end
 
-    -- Draw health bar (always visible for enemies)
+    -- Draw health bar using base class method (which fades correctly)
     self:drawHealthBar()
-
-    love.graphics.setColor(1, 1, 1)
-end
-
--- Override health bar to always show for enemies
-function Enemy:drawHealthBar()
-    local barWidth = 50
-    local barHeight = 6
-    local x = self.x + self.width/2 - barWidth/2
-    local y = self.y - 15
-
-    -- Background
-    love.graphics.setColor(0.2, 0.2, 0.2)
-    love.graphics.rectangle('fill', x, y, barWidth, barHeight)
-
-    -- Health bar
-    local healthPercent = self.health / self.maxHealth
-    if healthPercent > 0.6 then
-        love.graphics.setColor(0, 1, 0)  -- Green
-    elseif healthPercent > 0.3 then
-        love.graphics.setColor(1, 1, 0)  -- Yellow
-    else
-        love.graphics.setColor(1, 0, 0)  -- Red
-    end
-    love.graphics.rectangle('fill', x, y, barWidth * healthPercent, barHeight)
-
-    -- Outline
-    love.graphics.setColor(0, 0, 0)
-    love.graphics.rectangle('line', x, y, barWidth, barHeight)
 
     love.graphics.setColor(1, 1, 1)
 end
@@ -230,33 +227,60 @@ function Enemy:getNetworkState()
     }
 end
 
--- NETWORKING: Applies network state to the enemy
+-- NETWORKING: Applies network state to the enemy - FIXED VERSION
 function Enemy:applyNetworkState(state)
+    if not state then return end
+
+    local oldHealth = self.health
+
+    -- Convert from center to top-left
     if state.x and state.y then
-        -- Convert center to top-left
         self.x = state.x - self.width/2
         self.y = state.y - self.height/2
     end
+
     if state.health then
         self.health = state.health
     end
+
     if state.maxHealth then
         self.maxHealth = state.maxHealth
     end
-    self.isAlive = (state.alive == 1) or state.alive == true
 
-    -- Flash white when damaged
-    if state.health and state.health < self.health then
-        self.damageFlashTimer = 0.2
+    if state.id then
+        self.enemyId = state.id
+    end
+
+    if state.type then
+        self.type = state.type
+    end
+
+    -- CRITICAL FIX: Handle alive state properly
+    if state.alive ~= nil then
+        self.isAlive = (state.alive == 1) or state.alive == true
+    elseif state.health then
+        self.isAlive = state.health > 0
+    end
+
+    -- Show health bar when health changes (network sync)
+    if state.health and state.health < oldHealth then
+        self:showHealthBarTemporarily()
+    end
+
+    -- Debug log
+    if state.health and oldHealth ~= state.health then
+        print(string.format("Enemy %s: Health updated %d -> %d, Alive: %s",
+              self.enemyId or "unknown", oldHealth, state.health, tostring(self.isAlive)))
     end
 end
 
 -- Take damage with death notification
 function Enemy:takeDamage(amount)
+    local oldHealth = self.health
     BaseCharacter.takeDamage(self, amount)
 
-    if not self.isAlive then
-        -- Enemy died - could trigger death effect/score here
+    if self.health <= 0 then
+        self.isAlive = false
         print(self.name .. " has been defeated!")
     end
 end

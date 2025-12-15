@@ -1,42 +1,72 @@
--- main.lua - Top-down multiplayer game with corrected networking
--- This is the main entry point for the game that orchestrates all systems
+-- main.lua - Top-down multiplayer wave survival game
 local Network = require "src.core.Network"
 local NetworkPlayer = require "src.core.NetworkPlayer"
+local PositionSync = require "src.core.PositionSync"
 local World = require "src.core.World"
 local BaseCharacter = require "src.entities.BaseCharacter"
 local MainMenu = require "src.ui.MainMenu"
 local Player = require "src.entities.Player"
+local HostControl = require "src.ui.HostControl"
 
 -- GAME STATE MANAGEMENT
 -- =====================
--- Tracks the current state of the game application
-local gameState = "menu"          -- "menu", "connecting", or "playing"
+local gameState = "menu"          -- "menu", "connecting", "playing"
 local localPlayer = nil           -- The player controlled by this instance
 local remotePlayers = {}          -- Table of other players connected
 local myPlayerId = nil            -- Our assigned player ID from server
 local enemies = {}                -- Table of active enemies
 local mainMenu = nil              -- Main menu UI instance
+local hostControl = nil           -- Host control UI
 local debugFont = nil             -- Font for debug information display
-local showDebugInfo = true        -- Toggles debug overlay (set to TRUE for debugging)
+local showDebugInfo = true        -- Toggles debug overlay
+
+-- Track enemy creation timestamps to prevent duplicate creation
+local enemyCreationTimestamps = {}
+
+-- Game state
+local allPlayersDead = false
+local gameActive = false
 
 -- DEBUG: Track frame count for periodic logging
 local frameCount = 0
 local lastDebugOutput = 0
 
+-- Debug: Debug logging to trace where nil is coming from
+function validatePlayerState(state, playerName)
+    if not state then
+        print("ERROR: State is nil for player:", playerName)
+        return false
+    end
+
+    if type(state) ~= "table" then
+        print("ERROR: State is not a table for player:", playerName, type(state))
+        return false
+    end
+
+    print(string.format("DEBUG %s: x=%s, y=%s, health=%s, type_x=%s, type_y=%s, type_health=%s",
+        playerName,
+        tostring(state.x), tostring(state.y), tostring(state.health),
+        type(state.x), type(state.y), type(state.health)))
+
+    return true
+end
+
 -- LOVE2D LOAD FUNCTION
--- ====================
--- Initializes game systems and sets up initial state
 function love.load()
-    love.window.setTitle("Top-Down Network Game")
+    love.window.setTitle("Top-Down Wave Survival Game")
     love.window.setMode(800, 600)
 
     -- Initialize subsystems
     debugFont = love.graphics.newFont(12)
     World.init()
+    hostControl = HostControl:new()
 
-    -- Create main menu and link it to the network module
+    -- Create main menu
     mainMenu = MainMenu:new()
     mainMenu.network = Network
+    mainMenu.onStateChange = function(state)
+        switchGameState(state)
+    end
 
     -- Configure network event callbacks
     setupNetworkCallbacks()
@@ -44,80 +74,130 @@ function love.load()
     -- Start in menu state
     switchGameState("menu")
 
+    -- Load mods
+    local success, modLoader = pcall(require, "mods.mod_loader")
+    if success then
+        modLoader.loadMods()
+    else
+        print("Note: Mod system not available")
+    end
+
     print("Game loaded successfully. Press F1 to toggle debug info.")
 end
 
 -- NETWORK CALLBACK SETUP
--- ======================
--- Configures how the game responds to various network events
 function setupNetworkCallbacks()
     -- Called when connection to server is established
     Network.setConnectCallback(function()
         print("Network: Successfully connected to server!")
-        -- CRITICAL FIX: Switch to connecting state when we connect
-        if gameState == "menu" then
-            switchGameState("connecting")
+        -- When connected, we enter the game
+        if gameState == "connecting" then
+            switchGameState("playing")
         end
     end)
 
-    -- Called when server sends initial game state (player positions, IDs, etc.)
+    -- Called when server sends our player ID
+    Network.setPlayerIdCallback(function(data)
+        myPlayerId = data.id
+        print("Network: Received player ID from server: " .. myPlayerId)
+    end)
+
+    -- Called when server sends initial game state
     Network.setGameStateCallback(function(data)
         print("Network: Received initial game state from server")
         myPlayerId = data.yourId
-        print("My player ID assigned by server:", myPlayerId)
+        gameActive = data.gameActive or false
 
-        -- CRITICAL FIX: Always create local player from server data or spawn location
-        local spawnX, spawnY
-        if data.players and data.players[myPlayerId] then
-            -- Use server-provided position
-            local playerData = data.players[myPlayerId]
-            spawnX = playerData.x
-            spawnY = playerData.y
-            print(string.format("Creating local player from server data: (%d, %d)", spawnX, spawnY))
-        else
-            -- Fallback spawn
-            spawnX, spawnY = World.findSpawnLocation()
-            print(string.format("Creating local player from fallback: (%d, %d)", spawnX, spawnY))
-        end
+        -- Clear existing players first to prevent duplicates
+        localPlayer = nil
+        remotePlayers = {}
+        enemies = {}
 
-        createLocalPlayer("Player_" .. myPlayerId, spawnX, spawnY)
-
-        -- Create remote players for ALL other players in the game state
-        -- This includes the host player if we're a client
+        -- Create players from server data
         if data.players then
             for id, playerData in pairs(data.players) do
-                if id ~= myPlayerId then
-                    print("Creating remote player from game state:", id, "at", playerData.x, playerData.y)
+                if id == myPlayerId then
+                    -- This is us, create local player
+                    createLocalPlayer("Player_" .. myPlayerId, playerData.x, playerData.y,
+                                    playerData.health, playerData.alive)
+                else
+                    -- This is another player, create remote player
                     createRemotePlayer(id, playerData)
                 end
             end
         else
-            print("WARNING: No players data in game state!")
+            -- No player data yet, create local player at spawn
+            local spawnX, spawnY = World.findSpawnLocation()
+            createLocalPlayer("Player_" .. myPlayerId, spawnX, spawnY, 100, true)
         end
 
-        -- NEW: CREATE ENEMIES FROM INITIAL GAME STATE
+        -- Create enemies
         if data.enemies then
-            print("Creating enemies from initial game state:", tableCount(data.enemies))
             for enemyId, enemyData in pairs(data.enemies) do
-                print("Creating enemy from game state:", enemyId, "at", enemyData.x, enemyData.y)
                 createEnemy(enemyId, enemyData)
             end
-        else
-            print("No enemies in initial game state")
         end
 
-        -- CRITICAL FIX: Switch to playing state after receiving game state
         switchGameState("playing")
     end)
 
-    -- Called when a new player joins the game (including host when client joins)
+    -- Called when game starts (with countdown)
+    Network.setGameStartedCallback(function(data)
+        print("Network: Game started with countdown")
+        gameActive = true
+        hostControl:updateStatus(data)
+        hostControl:showMessage(data.message, 3)
+    end)
+
+    -- Called when wave starts
+    Network.setWaveStartedCallback(function(data)
+        print("Network: Wave " .. data.wave .. " started!")
+        gameActive = true
+        hostControl:updateStatus(data)
+        hostControl:showMessage(data.message, 3)
+    end)
+
+    -- Called when wave completes
+    Network.setWaveCompletedCallback(function(data)
+        print("Network: Wave " .. data.wave .. " completed!")
+        hostControl:updateStatus(data)
+        hostControl:showMessage(data.message, 3)
+
+        if data.gameCompleted then
+            print("Network: All stages completed!")
+            gameActive = false
+        end
+    end)
+
+    -- Called when game is over (all players dead)
+    Network.setGameOverCallback(function(data)
+        print("Network: Game Over!")
+        allPlayersDead = true
+        gameActive = false
+        hostControl:setAllPlayersDead(true)
+        hostControl:showMessage(data.message, 0)  -- Show until restart
+    end)
+
+    -- Called when game restarts
+    Network.setGameRestartCallback(function(data)
+        print("Network: Game restarted!")
+        allPlayersDead = false
+        gameActive = true
+        hostControl:setAllPlayersDead(false)
+        hostControl:showMessage(data.message, 3)
+
+        -- Reset local player health
+        if localPlayer then
+            localPlayer.health = 100
+            localPlayer.isAlive = true
+        end
+    end)
+
+    -- Called when a new player joins the game
     Network.setPlayerJoinedCallback(function(data)
         print("Network: Player joined:", data.id, "at", data.x, data.y)
-        -- Only create remote player if it's not our own ID
         if data.id ~= myPlayerId then
             createRemotePlayer(data.id, data)
-        else
-            print("Ignoring playerJoined for ourselves")
         end
     end)
 
@@ -126,7 +206,10 @@ function setupNetworkCallbacks()
         if remotePlayers[data.id] then
             remotePlayers[data.id]:applyNetworkUpdate(data)
         else
-            print("WARNING: Received update for unknown player:", data.id)
+            -- If we don't have this player yet, create them
+            if data.id ~= myPlayerId then
+                createRemotePlayer(data.id, data)
+            end
         end
     end)
 
@@ -139,7 +222,7 @@ function setupNetworkCallbacks()
         end
     end)
 
-    -- Called when server corrects our position (collision, cheating prevention)
+    -- Called when server corrects our position
     Network.setPlayerCorrectedCallback(function(data)
         if localPlayer then
             print("Network: Server corrected our position")
@@ -148,128 +231,126 @@ function setupNetworkCallbacks()
         end
     end)
 
-                -- Enemy related stuff
-                Network.setEnemySpawnedCallback(function(data)
-                    print("Enemy spawned:", data.id, "type:", data.type)
-                    createEnemy(data.id, data)
-                end)
+    -- Enemy related callbacks
+    Network.setEnemySpawnedCallback(function(data)
+        print("Enemy spawned:", data.id, "type:", data.type)
+        createEnemy(data.id, data)
+    end)
 
-                Network.setEnemyUpdatedCallback(function(data)
-                    if enemies[data.id] then
-                        enemies[data.id]:applyNetworkState(data)
-                    else
-                        print("WARNING: Received update for unknown enemy:", data.id)
-                    end
-                end)
-
-                Network.setEnemyDiedCallback(function(data)
-                    print("Enemy died:", data.id)
-                    if enemies[data.id] then
-                        enemies[data.id] = nil
-                    end
-                end)
-
-    -- Called when a player successfully performs an action
-    Network.setPlayerActionCallback(function(data)
-        -- Normalize player ID
-        local playerId = data.playerId
-        if playerId == "host" then
-            playerId = "Host"
+    Network.setEnemyUpdatedCallback(function(data)
+        if enemies[data.id] then
+            enemies[data.id]:applyNetworkState(data)
+        else
+            print("WARNING: Received update for unknown enemy:", data.id)
+            createEnemy(data.id, data)
         end
+    end)
 
-        -- FIXED: Handle host player action - host is always "Host" with capital H
-        if playerId == "Host" then
-            -- For host actions, we need to check if we're the host or a client
+    Network.setEnemyDiedCallback(function(data)
+        print("Enemy died:", data.id)
+        if enemies[data.id] then
+            enemies[data.id] = nil
+        end
+        enemyCreationTimestamps[data.id] = nil
+    end)
+
+    -- Called when a player performs an action
+    Network.setPlayerActionCallback(function(data)
+        local playerId = data.playerId
+
+        -- Handle Host player actions
+        if playerId == "host" or playerId == "Host" then
             if Network.isServer then
-                -- We ARE the host, so apply to localPlayer
+                -- If we're the server and this is our host player
                 if localPlayer and localPlayer.name == "Host" then
                     localPlayer:applyActionEffect(data)
                 end
             else
-                -- We're a client, so host is a remote player
+                -- If we're a client and this is the host's action
                 if remotePlayers["Host"] then
                     remotePlayers["Host"]:applyActionEffect(data)
-                else
-                    print("WARNING: Received action for host but no host player found")
                 end
             end
         elseif remotePlayers[playerId] then
-            -- Apply action effect to remote player
+            -- Remote player action
             remotePlayers[playerId]:applyActionEffect(data)
         elseif playerId == myPlayerId and localPlayer then
-            -- If this action is for our local player (client)
+            -- Our own action (should be handled locally already)
             localPlayer:applyActionEffect(data)
         else
             print("WARNING: Received action for unknown player:", data.playerId)
         end
     end)
 
-    -- Called when host successfully creates a game
     Network.setHostCreatedCallback(function()
-        print("Network: Host game created - creating local player")
-        local x, y = World.findSpawnLocation()
-        createLocalPlayer("Host", x, y)
-        myPlayerId = "host"
+        print("Network: Host game created")
+        myPlayerId = "Host"
 
-        -- IMPORTANT: Update host player data in Network module so clients get it
+        -- Create local player for host
+        local x, y = World.findSpawnLocation()
+        createLocalPlayer("Host", x, y, 100, true)
+
+        -- Update host player data in Network
         if localPlayer then
             Network.setHostPlayerData(localPlayer:getNetworkState())
         end
 
         switchGameState("playing")
+        hostControl:show()
     end)
 
     -- Called when disconnected from server
     Network.setDisconnectCallback(function(data)
-        print("Network: Disconnected from server. Data:", data)
+        print("Network: Disconnected from server")
+
+        -- Clean up and return to menu
+        cleanupGame()
         switchGameState("menu")
     end)
 end
 
 -- PLAYER CREATION FUNCTIONS
--- =========================
-
--- Creates the player controlled by this game instance
--- @param name: Display name for the player
--- @param x: Starting X position (or table with position data)
--- @param y: Starting Y position (if x is not a table)
-function createLocalPlayer(name, x, y)
+function createLocalPlayer(name, x, y, health, isAlive)
     local spawnX, spawnY
 
-    -- Handle different parameter formats for backward compatibility
     if type(x) == "table" then
-        -- Old format: x is a table containing position
         spawnX = x.x or x[1] or 400
         spawnY = x.y or x[2] or 300
     else
-        -- New format: separate x and y parameters
         spawnX = x or 400
         spawnY = y or 300
     end
 
-    -- Create player instance and mark as locally controlled
     localPlayer = Player:new(name, spawnX, spawnY)
     localPlayer.isLocalPlayer = true
 
-    -- Ensure host player has consistent name
     if name == "Host" then
-        localPlayer.name = "Host"  -- Ensure uppercase H
+        localPlayer.name = "Host"
     end
 
-    print(string.format("Local player '%s' created at (%d, %d)", name, spawnX, spawnY))
+    -- Set health and alive state
+    if health then
+        localPlayer.health = health
+        localPlayer.maxHealth = 100
+    end
+
+    if isAlive ~= nil then
+        localPlayer.isAlive = isAlive
+    end
+
+    print(string.format("Local player '%s' created at (%d, %d) Health: %d Alive: %s",
+          name, spawnX, spawnY, localPlayer.health, tostring(localPlayer.isAlive)))
 end
 
--- Creates a visual representation of a remote player
--- @param id: Unique network ID of the remote player
--- @param data: Initial state data from server
 function createRemotePlayer(id, data)
-    -- Normalize host ID to "Host" (capital H)
+    -- Don't create remote player for ourselves
+    if id == myPlayerId then return end
+
     local normalizedId = id
     if id == "host" then
         normalizedId = "Host"
     end
 
-    -- Check if player already exists
     if remotePlayers[normalizedId] then
         print("Remote player already exists:", normalizedId)
         return
@@ -277,175 +358,277 @@ function createRemotePlayer(id, data)
 
     local player = NetworkPlayer:new(normalizedId, data.x, data.y)
     player.health = data.health or 100
+    player.maxHealth = 100
+    player.isAlive = data.alive or (data.health or 100) > 0
     remotePlayers[normalizedId] = player
-    print(string.format("Remote player '%s' created at (%d, %d)", normalizedId, data.x, data.y))
+
+    print(string.format("Remote player '%s' created at (%d, %d) Health: %d Alive: %s",
+          normalizedId, data.x, data.y, player.health, tostring(player.isAlive)))
 end
 
--- Creates a visual representation of a enemy
 function createEnemy(enemyId, data)
+    -- Prevent rapid duplicate creation
+    local now = love.timer.getTime()
+    if enemyCreationTimestamps[enemyId] and (now - enemyCreationTimestamps[enemyId] < 0.1) then
+        print("DEBUG: Ignoring rapid duplicate enemy creation:", enemyId)
+        return
+    end
+
+    if enemies[enemyId] then
+        print("Enemy already exists, updating:", enemyId)
+        enemies[enemyId]:applyNetworkState(data)
+        enemyCreationTimestamps[enemyId] = now
+        return
+    end
+
     local Enemy = require "src.entities.Enemy"
+
+    -- CRITICAL FIX: Create enemy with correct parameters
+    -- data.x and data.y are center coordinates from network
     local enemy = Enemy:new("Enemy_" .. enemyId, data.x, data.y, data.type)
+
+    -- Set properties from network data
     enemy.health = data.health or 100
+    enemy.maxHealth = enemy.health
     enemy.enemyId = enemyId
+    enemy.isAlive = (data.alive == 1) or (data.alive == true) or (data.health > 0)  -- Use network alive flag
+
+    -- Store enemy
     enemies[enemyId] = enemy
-    print(string.format("Enemy %s created at (%d, %d)", enemyId, data.x, data.y))
+    enemyCreationTimestamps[enemyId] = now
+
+    print(string.format("Enemy %s created at (%d, %d) Type: %s Health: %d Alive: %s",
+          enemyId, data.x, data.y, data.type or "unknown", enemy.health, tostring(enemy.isAlive)))
 end
 
 -- GAME STATE TRANSITIONS
--- ======================
-
--- Manages transitions between different game states
--- @param newState: The state to transition to ("menu", "connecting", "playing")
 function switchGameState(newState)
     print("Game State Transition:", gameState, "->", newState)
     gameState = newState
 
     if newState == "menu" then
-        cleanupGame()                 -- Clear game objects
+        cleanupGame()
         if mainMenu then mainMenu:activate() end
+        hostControl:hide()
+        PositionSync.setActive(false)
+
     elseif newState == "connecting" then
         if mainMenu then mainMenu:deactivate() end
+        hostControl:hide()
+        PositionSync.setActive(false)
+
     elseif newState == "playing" then
         if mainMenu then mainMenu:deactivate() end
+
+        -- Activate position sync when playing
+        PositionSync.setActive(true)
+
+        -- Show host control if we're the host
+        if Network.isServer then
+            hostControl:show()
+        end
     end
 end
 
--- Cleans up game objects when returning to menu
 function cleanupGame()
+    print("Cleaning up game state...")
+
+    if Network.isConnected() then
+        Network.disconnect()
+    end
+
     localPlayer = nil
     remotePlayers = {}
     myPlayerId = nil
-    enemies = {}  -- Clear enemies too!
+    enemies = {}
     BaseCharacter.all = {}
+    enemyCreationTimestamps = {}
+    allPlayersDead = false
+    gameActive = false
 
-    -- Clean up network connections
-    if Network.isConnected() then
-        -- Network module will handle cleanup through its callbacks
-    end
+    print("Game state cleaned up")
 end
 
 -- LOVE2D UPDATE LOOP
--- ==================
-
--- Main game loop called every frame
--- @param dt: Delta time in seconds since last frame
 function love.update(dt)
-    Network.update(dt)  -- Process network events
+    Network.update(dt)
 
     frameCount = frameCount + 1
 
-    -- DEBUG: Log state every 60 frames (1 second at 60fps)
+    -- Debug output every 60 frames
     if frameCount % 60 == 0 and gameState == "playing" then
-        print(string.format("Frame %d: State=%s, LocalPlayer=%s, RemotePlayers=%d, Enemies=%d",
-              frameCount, gameState, tostring(localPlayer ~= nil), tableCount(remotePlayers), tableCount(enemies)))
+        print(string.format("Frame %d: LocalPlayer=%s, RemotePlayers=%d, Enemies=%d, GameActive=%s",
+              frameCount, tostring(localPlayer ~= nil), tableCount(remotePlayers), tableCount(enemies), tostring(gameActive)))
+
+        -- Debug: Print player positions
+        if localPlayer then
+            local centerX, centerY = localPlayer:getCenter()
+            print(string.format("  Local Player: center(%d, %d) top-left(%d, %d) Health: %d",
+                  math.floor(centerX), math.floor(centerY),
+                  math.floor(localPlayer.x), math.floor(localPlayer.y),
+                  localPlayer.health))
+        end
+
+        for id, remotePlayer in pairs(remotePlayers) do
+            if remotePlayer then
+                local centerX, centerY = remotePlayer:getCenter()
+                print(string.format("  Remote %s: center(%d, %d) target(%d, %d) Health: %d",
+                      id, math.floor(centerX), math.floor(centerY),
+                      math.floor(remotePlayer.targetCenterX or 0), math.floor(remotePlayer.targetCenterY or 0),
+                      remotePlayer.health))
+            end
+        end
     end
 
     if gameState == "menu" then
         if mainMenu then mainMenu:update(dt) end
     elseif gameState == "connecting" then
-        -- Waiting for network connection - no updates needed
+        -- Nothing to update while connecting
     elseif gameState == "playing" then
+        -- Update host control
+        hostControl:update(dt)
+
+        -- Add a position sync system to ensure players see each other move
+        PositionSync.update(dt)
+
         -- Update local player and send state to server
-        if localPlayer then
+        if localPlayer and localPlayer.isAlive then
             localPlayer:update(dt)
 
-            -- Send our current state to the server (if we're a client)
-            -- Host doesn't need to send updates to itself
-            if Network.isConnected() and localPlayer.isLocalPlayer and not Network.isServer then
-                Network.sendPlayerState(localPlayer:getNetworkState())
-            elseif Network.isServer then
-                -- Host: update our data in the Network module for new clients
-                                                                local currentState = localPlayer:getNetworkState()
-                            Network.setHostPlayerData(currentState)
+            if Network.isConnected() and localPlayer.isLocalPlayer then
+                -- Send position updates at a controlled rate
+                local currentTime = love.timer.getTime()
+                if not localPlayer.lastSendTime or (currentTime - localPlayer.lastSendTime) > 0.05 then -- 20 times/sec
+                    local state = localPlayer:getNetworkState()
+
+                    -- Validate state before sending
+                    if state and type(state) == "table" and state.x and state.y and state.health then
+                        -- Ensure values are valid numbers
+                        if tonumber(state.x) and tonumber(state.y) and tonumber(state.health) then
+                            if not Network.isServer then
+                                -- Client: Send state to server
+                                Network.sendPlayerState(state)
+                            else
+                                -- Host: Update internal state
+                                Network.setHostPlayerData(state)
+                            end
+                        else
+                            print("DEBUG: Invalid number values in player state:", state.x, state.y, state.health)
+                        end
+                    else
+                        print("DEBUG: Invalid player state structure:", state)
+                    end
+
+                    localPlayer.lastSendTime = currentTime
+                end
             end
         end
 
-        -- Update remote players (interpolation, etc.)
+        -- Update remote players
         for id, remotePlayer in pairs(remotePlayers) do
-            if remotePlayer then  -- Check if player still exists
+            if remotePlayer then
                 remotePlayer:update(dt)
             end
         end
 
-                                -- Update enemies
+        -- Update enemies (clients interpolate, server runs AI)
         for id, enemy in pairs(enemies) do
             if enemy then
-                -- Get all players for enemy AI
                 local allPlayers = {}
-                if localPlayer then table.insert(allPlayers, localPlayer) end
+                if localPlayer and localPlayer.isAlive then table.insert(allPlayers, localPlayer) end
                 for _, remotePlayer in pairs(remotePlayers) do
-                    if remotePlayer then table.insert(allPlayers, remotePlayer) end
+                    if remotePlayer and remotePlayer.isAlive then table.insert(allPlayers, remotePlayer) end
                 end
-
                 enemy:update(dt, allPlayers)
             end
         end
 
-        -- Update all base characters (enemies, etc.)
-        BaseCharacter.updateAll(dt)
+        -- Update all base characters
+        require("src.entities.BaseCharacter").updateAll(dt)
     end
 end
 
--- LOVE2D DRAW LOOP
--- ================
+-- Add a new debug visualization function
+function drawNetworkDebug()
+    if not showDebugInfo then return end
 
--- Renders the game world and UI
+    love.graphics.setFont(debugFont)
+
+    -- Draw network player position markers
+    for id, remotePlayer in pairs(remotePlayers) do
+        if remotePlayer then
+            -- Draw center position (red)
+            local centerX, centerY = remotePlayer:getCenter()
+            love.graphics.setColor(1, 0, 0, 0.5)
+            love.graphics.circle("fill", centerX, centerY, 5)
+
+            -- Draw target position (green)
+            love.graphics.setColor(0, 1, 0, 0.5)
+            love.graphics.circle("line", remotePlayer.targetCenterX, remotePlayer.targetCenterY, 8)
+
+            -- Draw connection line between current and target
+            love.graphics.setColor(1, 1, 0, 0.3)
+            love.graphics.line(centerX, centerY, remotePlayer.targetCenterX, remotePlayer.targetCenterY)
+
+            -- Draw ID text
+            love.graphics.setColor(1, 1, 1)
+            love.graphics.print(id, centerX + 10, centerY - 10)
+        end
+    end
+
+    -- Draw local player center marker
+    if localPlayer then
+        local centerX, centerY = localPlayer:getCenter()
+        love.graphics.setColor(0, 1, 1, 0.5)  -- Cyan for local player
+        love.graphics.circle("fill", centerX, centerY, 6)
+        love.graphics.setColor(0, 1, 1, 0.3)
+        love.graphics.circle("line", centerX, centerY, 10)
+    end
+
+    love.graphics.setColor(1, 1, 1)
+end
+
+-- LOVE2D DRAW LOOP
 function love.draw()
     -- Draw the static world first
     World.draw()
 
-    -- Draw game elements based on current state
     if gameState == "menu" then
         if mainMenu then mainMenu:draw() end
     elseif gameState == "connecting" then
-        -- Draw connecting screen
         love.graphics.setColor(0, 0, 0, 0.8)
         love.graphics.rectangle("fill", 0, 0, 800, 600)
         love.graphics.setColor(1, 1, 1)
         love.graphics.print("Connecting to server...", 350, 300)
     elseif gameState == "playing" then
-                        -- Draw enemies first (background)
-                        for id, enemy in pairs(enemies) do
-                                        if enemy then
-                                                        enemy:draw()
-                                        end
-                        end
-
-        -- DEBUG: Draw coordinate grid for troubleshooting
-        drawDebugGrid()
-
-        -- DEBUG: Draw a marker at world origin (0,0)
-        love.graphics.setColor(1, 0, 0, 0.5)
-        love.graphics.circle("fill", 0, 0, 10)
-        love.graphics.setColor(1, 1, 1)
-
-        -- Draw remote players
-        for id, remotePlayer in pairs(remotePlayers) do
-            if remotePlayer then  -- Check if player still exists
-                remotePlayer:draw()
-
-                -- DEBUG: Draw position marker for remote player
-                love.graphics.setColor(0, 1, 0, 0.5)
-                love.graphics.circle("line", remotePlayer.x, remotePlayer.y, 5)
-                love.graphics.setColor(1, 1, 1)
+        -- Draw enemies first (background)
+        for id, enemy in pairs(enemies) do
+            if enemy and enemy.isAlive then  -- CRITICAL: Check both existence and alive status
+                enemy:draw()
             end
         end
 
-        -- Draw local player on top
-        if localPlayer then
+        -- Draw remote players (only if alive)
+        for id, remotePlayer in pairs(remotePlayers) do
+            if remotePlayer and remotePlayer.isAlive then
+                remotePlayer:draw()
+            end
+        end
+
+        -- Draw local player (if alive)
+        if localPlayer and localPlayer.isAlive then
             localPlayer:draw()
             localPlayer:drawHealthBar()
-
-            -- DEBUG: Draw position marker for local player
-            love.graphics.setColor(1, 1, 0, 0.5)
-            love.graphics.circle("line", localPlayer.x, localPlayer.y, 8)
-            love.graphics.setColor(1, 1, 1)
-        else
-            print("DEBUG: No local player to draw!")
         end
+
+        -- Draw host control panel
+        hostControl:draw()
 
         -- Draw game UI overlay
         drawGameUI()
+
+        -- Draw network debug visualization
+        drawNetworkDebug()
     end
 
     -- Draw debug info overlay if enabled
@@ -454,24 +637,7 @@ function love.draw()
     end
 end
 
--- Draws a debug grid to help with coordinate issues
-function drawDebugGrid()
-    love.graphics.setColor(0.3, 0.3, 0.3, 0.3)
-    for x = 0, 800, 50 do
-        love.graphics.line(x, 0, x, 600)
-        love.graphics.print(tostring(x), x, 10)
-    end
-    for y = 0, 600, 50 do
-        love.graphics.line(0, y, 800, y)
-        love.graphics.print(tostring(y), 10, y)
-    end
-    love.graphics.setColor(1, 1, 1)
-end
-
 -- UI RENDERING FUNCTIONS
--- ======================
-
--- Draws the in-game UI overlay
 function drawGameUI()
     love.graphics.setFont(debugFont)
 
@@ -479,21 +645,15 @@ function drawGameUI()
     love.graphics.setColor(0, 0, 0, 0.5)
     love.graphics.rectangle("fill", 5, 5, 250, 120)
 
-    -- UI text
     love.graphics.setColor(1, 1, 1)
     love.graphics.print("Game Status", 10, 10)
     love.graphics.print("Mode: " .. (Network.isServer and "HOST" or "CLIENT"), 10, 30)
     love.graphics.print("Connected: " .. (Network.isConnected() and "YES" or "NO"), 10, 50)
     love.graphics.print("My ID: " .. (myPlayerId or "none"), 10, 70)
-    love.graphics.print("Remote Players: " .. tableCount(remotePlayers), 10, 90)
+    love.graphics.print("Players: " .. tableCount(remotePlayers), 10, 90)
     love.graphics.print("Enemies: " .. tableCount(enemies), 10, 110)
-
-    if localPlayer then
-        love.graphics.print("Local Pos: " .. math.floor(localPlayer.x) .. "," .. math.floor(localPlayer.y), 10, 130)
-    end
 end
 
--- Draws debug information overlay
 function drawDebugInfo()
     love.graphics.setFont(debugFont)
 
@@ -518,29 +678,23 @@ function drawDebugInfo()
         yPos = yPos + 20
         love.graphics.print("  Pos: " .. math.floor(localPlayer.x) .. "," .. math.floor(localPlayer.y), 555, yPos)
         yPos = yPos + 20
+        love.graphics.print("  Health: " .. localPlayer.health .. "/" .. localPlayer.maxHealth, 555, yPos)
+        yPos = yPos + 20
+    else
+        love.graphics.print("Local: No player", 555, yPos)
+        yPos = yPos + 40
     end
 
     love.graphics.print("Remote Players: " .. tableCount(remotePlayers), 555, yPos)
     yPos = yPos + 20
     love.graphics.print("Enemies: " .. tableCount(enemies), 555, yPos)
     yPos = yPos + 20
-
-    -- Show remote player positions
-    for id, player in pairs(remotePlayers) do
-        if yPos < 180 then  -- Don't overflow the panel
-            love.graphics.print(id .. ": " .. math.floor(player.x) .. "," .. math.floor(player.y), 555, yPos)
-            yPos = yPos + 15
-        end
-    end
+    love.graphics.print("Game Active: " .. tostring(gameActive), 555, yPos)
 end
 
 -- INPUT HANDLING
--- ==============
-
--- Handles keyboard input events
--- @param key: The key that was pressed
 function love.keypressed(key)
-    -- Global key bindings (work in any state)
+    -- Global key bindings
     if key == "escape" then
         if gameState == "playing" then
             switchGameState("menu")
@@ -549,19 +703,27 @@ function love.keypressed(key)
         end
     elseif key == "f1" then
         showDebugInfo = not showDebugInfo
-    elseif key == "f3" and localPlayer then
-        -- Debug: print detailed player state
-        print(string.format("Local Player - isLocalPlayer: %s, Position: %d, %d",
-              tostring(localPlayer.isLocalPlayer), localPlayer.x, localPlayer.y))
     elseif key == "f5" then
-        -- Debug: print network status
         Network.printDebugInfo()
-    elseif key == "f6" then
-        -- Debug: force create a test remote player
-        if gameState == "playing" then
-            local testX, testY = World.findSpawnLocation()
-            createRemotePlayer("test_debug", {x = testX, y = testY, health = 100})
-            print("DEBUG: Created test remote player at", testX, testY)
+    elseif key == "f7" then
+        print("=== DEBUG: PLAYER STATES ===")
+        print("Local Player:", localPlayer and string.format("Health: %d, Alive: %s",
+              localPlayer.health, tostring(localPlayer.isAlive)) or "NONE")
+
+        print("Remote Players:")
+        for id, player in pairs(remotePlayers) do
+            if player then
+                print(string.format("  %s: Health: %d, Alive: %s, X: %d, Y: %d",
+                      id, player.health, tostring(player.isAlive), player.x, player.y))
+            end
+        end
+
+        print("Enemies:")
+        for id, enemy in pairs(enemies) do
+            if enemy then
+                print(string.format("  %s: Health: %d, Alive: %s, Type: %s",
+                      id, enemy.health, tostring(enemy.isAlive), enemy.type or "unknown"))
+            end
         end
     end
 
@@ -575,46 +737,42 @@ function love.keypressed(key)
             mainMenu:selectCurrent()
         end
     elseif gameState == "playing" then
-        if key == "space" and localPlayer then
-            print(localPlayer.name .. " performs action!")
-        elseif key == "p" then
-            -- Debug: print all remote players
+        -- Host controls
+        if Network.isServer then
+            if key == "g" and not gameActive then
+                -- Start game
+                Network.onStartGame({}, {getIndex = function() return "host" end})
+            elseif key == "space" and hostControl.awaitingConfirmation then
+                -- Confirm wave
+                Network.onWaveConfirm({}, {getIndex = function() return "host" end})
+            elseif key == "r" then
+                -- Restart game
+                Network.onRestartGame({}, {getIndex = function() return "host" end})
+            end
+        end
+
+        -- Debug keys
+        if key == "p" then
             print("=== Remote Players ===")
             for id, player in pairs(remotePlayers) do
                 print(string.format("  %s: (%d, %d) Health: %d", id, player.x, player.y, player.health))
             end
-        elseif key == "l" then
-            -- Debug: print local player info
-            if localPlayer then
-                print("=== Local Player ===")
-                print(string.format("  ID: %s, Position: (%d, %d), Health: %d",
-                      myPlayerId, localPlayer.x, localPlayer.y, localPlayer.health))
+        elseif key == "e" then
+            print("=== Enemies ===")
+            for id, enemy in pairs(enemies) do
+                print(string.format("  %s: (%d, %d) Health: %d", id, enemy.x, enemy.y, enemy.health))
             end
-        elseif key == "r" then
-            -- Debug: print render info
-            print("=== Render Info ===")
-            print("Local player exists:", localPlayer ~= nil)
-            print("Remote player count:", tableCount(remotePlayers))
-            print("Enemy count:", tableCount(enemies))
-            print("Screen size: 800x600")
-            print("Game State:", gameState)
         end
     end
 end
 
 -- UTILITY FUNCTIONS
--- =================
-
--- Counts the number of elements in a table
--- @param t: Table to count
--- @return: Number of key-value pairs
 function tableCount(t)
     local count = 0
     for _ in pairs(t) do count = count + 1 end
     return count
 end
 
--- Called when game is closing
 function love.quit()
     print("Game closing...")
     return false
