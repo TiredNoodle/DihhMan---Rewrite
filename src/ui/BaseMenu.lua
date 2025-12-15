@@ -51,7 +51,9 @@ function BaseMenu:selectCurrent()
     if not self.isActive then return end
     local option = self.options[self.selectedIndex]
     if option and option.callback then
-        print("Menu selected:", option.text)
+        -- Get the option text for display
+        local optionText = option.text or ""
+        print("Menu selected:", optionText)
         option.callback() -- Execute the option's action.
     end
 end
@@ -70,12 +72,15 @@ function BaseMenu:draw(x, y)
     -- Draw each option, highlighting the selected one.
     for i, option in ipairs(self.options) do
         local optionY = y + 40 + (i * 30) -- Positioning.
+        -- Get the option text (always a string now)
+        local optionText = option.text or ""
+
         if i == self.selectedIndex then
             love.graphics.setColor(0, 1, 0) -- Green for selected.
-            love.graphics.print("> " .. option.text, x, optionY)
+            love.graphics.print("> " .. optionText, x, optionY)
         else
             love.graphics.setColor(0.7, 0.7, 0.7) -- Grey for unselected.
-            love.graphics.print("  " .. option.text, x, optionY)
+            love.graphics.print("  " .. optionText, x, optionY)
         end
     end
     love.graphics.setColor(1, 1, 1)

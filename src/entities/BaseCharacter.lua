@@ -30,6 +30,13 @@ function BaseCharacter:initialize(name, x, y)
     -- Track all created characters (useful for global updates/drawing)
     BaseCharacter.all = BaseCharacter.all or {}
     table.insert(BaseCharacter.all, self)
+
+    -- NEW: Health bar fade timer
+    self.healthBarAlpha = 0
+    self.healthBarVisibleTime = 0  -- How long to show health bar after damage
+    self.showHealthBar = false
+    self.lastHealth = self.health  -- Track health changes
+
     print(string.format("Character '%s' created at (%d, %d)", self.name, self.x, self.y))
 end
 
@@ -83,6 +90,44 @@ function BaseCharacter:update(dt)
         self.x = newX
         self.y = newY
     end
+
+    -- NEW: Update health bar visibility and fade
+    if self.showHealthBar then
+        self.healthBarVisibleTime = self.healthBarVisibleTime - dt
+        if self.healthBarVisibleTime <= 0 then
+            self.healthBarVisibleTime = 0
+            self.showHealthBar = false
+        end
+
+        -- Fade out in the last 0.5 seconds (of 3 seconds total)
+        if self.healthBarVisibleTime <= 0.5 then
+            self.healthBarAlpha = self.healthBarVisibleTime / 0.5
+        else
+            self.healthBarAlpha = 1
+        end
+    else
+        self.healthBarAlpha = 0
+    end
+
+    -- Check for health changes
+    if self.health ~= self.lastHealth then
+        self:onHealthChanged(self.lastHealth, self.health)
+        self.lastHealth = self.health
+    end
+end
+
+-- NEW: Called when health changes
+function BaseCharacter:onHealthChanged(oldHealth, newHealth)
+    if newHealth < oldHealth then  -- Only show on damage, not healing
+        self:showHealthBarTemporarily()
+    end
+end
+
+-- NEW: Show health bar for a limited time - UPDATED TO 3 SECONDS
+function BaseCharacter:showHealthBarTemporarily()
+    self.showHealthBar = true
+    self.healthBarVisibleTime = 3.0  -- Show for 3 seconds after damage
+    self.healthBarAlpha = 1
 end
 
 -- Basic drawing method. Subclasses should override this for custom visuals.
@@ -100,7 +145,14 @@ end
 
 -- Take damage. Override in subclasses for special death effects.
 function BaseCharacter:takeDamage(amount)
+    local oldHealth = self.health
     self.health = self.health - amount
+
+    -- Show health bar when taking damage
+    if self.health < oldHealth then
+        self:showHealthBarTemporarily()
+    end
+
     if self.health <= 0 then
         self:die()
     end
@@ -125,22 +177,28 @@ function BaseCharacter:getCenter()
     return self.x + self.width/2, self.y + self.height/2
 end
 
--- Draws a simple health bar above the character if damaged.
+-- Draws a health bar above the character (fades out after damage)
 function BaseCharacter:drawHealthBar()
-    if self.health < self.maxHealth then
+    if self.healthBarAlpha > 0 and self.health < self.maxHealth then
         local barWidth = 50
         local barHeight = 6
         local x = self.x + self.width/2 - barWidth/2
         local y = self.y - 15
 
-        love.graphics.setColor(0.2, 0.2, 0.2) -- Background
+        -- Background with alpha
+        love.graphics.setColor(0.2, 0.2, 0.2, self.healthBarAlpha)
         love.graphics.rectangle('fill', x, y, barWidth, barHeight)
 
         local healthPercent = self.health / self.maxHealth
-        love.graphics.setColor(1 - healthPercent, healthPercent, 0) -- Green to Red
+        -- Color changes based on health percentage
+        local r = 1 - healthPercent
+        local g = healthPercent
+        local b = 0
+
+        love.graphics.setColor(r, g, b, self.healthBarAlpha)
         love.graphics.rectangle('fill', x, y, barWidth * healthPercent, barHeight)
 
-        love.graphics.setColor(1, 1, 1)
+        love.graphics.setColor(1, 1, 1, 1)
     end
 end
 

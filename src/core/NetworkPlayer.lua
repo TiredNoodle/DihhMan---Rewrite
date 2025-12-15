@@ -3,6 +3,7 @@
 -- Handles interpolation and display of other players' characters
 
 local Player = require "src.entities.Player"
+local BaseCharacter = require "src.entities.BaseCharacter"
 
 local NetworkPlayer = Player:subclass('NetworkPlayer')
 
@@ -28,37 +29,40 @@ function NetworkPlayer:initialize(playerId, x, y)
 
     self.lastUpdateTime = 0       -- Timestamp of last update
 
+    -- Clear velocity to prevent unwanted movement
+    self.velocity = {x = 0, y = 0}
+
+    -- Add interpolation properties
+    self.interpolationSpeed = 8.0
+
     print(string.format("NetworkPlayer created: ID=%s at center (%d, %d)", playerId, x, y))
 end
 
 function NetworkPlayer:update(dt)
-    -- Update action cooldowns (inherited from Player)
-    for actionName, action in pairs(self.actions) do
-        if action.timer > 0 then
-            action.timer = action.timer - dt
-        end
-    end
-
-    -- Update action effects
-    self:updateActionEffects(dt)
-
-    -- Skip input handling (NetworkPlayers don't accept local input)
-    -- Don't call Player.handleInput or Player.handleActions
+    -- Call parent update for health bar and base movement
+    Player.update(self, dt)
 
     -- Interpolate position if we have target positions
     if self.targetCenterX ~= self.centerX or self.targetCenterY ~= self.centerY then
-        -- Linear interpolation for smooth movement
-        local interpolationSpeed = 8
+        -- Calculate distance to target
         local dx = self.targetCenterX - self.centerX
         local dy = self.targetCenterY - self.centerY
         local distance = math.sqrt(dx * dx + dy * dy)
 
-        if distance < 1 then
+        if distance < 2 then
+            -- Close enough, snap to target
             self.centerX = self.targetCenterX
             self.centerY = self.targetCenterY
         else
-            self.centerX = self.centerX + dx * interpolationSpeed * dt
-            self.centerY = self.centerY + dy * interpolationSpeed * dt
+            -- Smooth interpolation with easing
+            local moveDist = self.interpolationSpeed * distance * dt
+            if moveDist > distance then
+                self.centerX = self.targetCenterX
+                self.centerY = self.targetCenterY
+            else
+                self.centerX = self.centerX + (dx / distance) * moveDist
+                self.centerY = self.centerY + (dy / distance) * moveDist
+            end
         end
 
         -- Update top-left corner for drawing (to match center position)
@@ -71,43 +75,83 @@ function NetworkPlayer:applyNetworkUpdate(data)
     if not data then return end
 
     -- Store new target CENTER position for interpolation
-    self.targetCenterX = data.x or self.targetCenterX
-    self.targetCenterY = data.y or self.targetCenterY
+    if data.x and data.y then
+        -- Always update target position (these are CENTER coordinates from network)
+        self.targetCenterX = data.x
+        self.targetCenterY = data.y
 
-    -- Update health
-    if data.health then
-        self.health = data.health
+        -- If we're far from target (> 100 pixels), jump to position immediately
+        local dx = math.abs(data.x - self.centerX)
+        local dy = math.abs(data.y - self.centerY)
+        if dx > 100 or dy > 100 then
+            self.centerX = data.x
+            self.centerY = data.y
+            self.x = self.centerX - self.width/2
+            self.y = self.centerY - self.height/2
+        end
     end
 
-    -- Update alive status
+    -- Update health and show health bar if health decreased
+    if data.health and data.health ~= self.health then
+        local oldHealth = self.health
+        self.health = data.health
+
+        if data.health < oldHealth then
+            self:showHealthBarTemporarily()
+        end
+
+        -- Update alive status based on health
+        self.isAlive = self.health > 0
+    end
+
+    -- Update alive status if explicitly provided
     if data.alive ~= nil then
         self.isAlive = (data.alive == 1) or data.alive == true
     end
 
     self.lastUpdateTime = love.timer.getTime()
-
-    -- Debug output for significant position changes
-    local dx = math.abs(self.targetCenterX - self.centerX)
-    local dy = math.abs(self.targetCenterY - self.centerY)
-    if dx > 10 or dy > 10 then
-        print(string.format("NetworkPlayer %s: Moving to center (%d, %d)",
-              self.id, self.targetCenterX, self.targetCenterY))
-    end
 end
 
 -- Apply action effect from network
 function NetworkPlayer:applyActionEffect(effectData)
-    -- Check if this action is for this player by comparing the playerId in the effectData with self.id
+    -- CRITICAL FIX: Check if this action is for us
+    local isForMe = false
+
+    -- Handle different ID formats
     if effectData.playerId == self.id then
+        isForMe = true
+    elseif effectData.playerId == "host" and self.id == "Host" then
+        isForMe = true
+    elseif effectData.playerId == "Host" and self.id == "Host" then
+        isForMe = true
+    end
+
+    if isForMe then
         -- Trigger the visual effect
         self:triggerActionEffect(effectData.action, effectData.targetId, effectData.targetX, effectData.targetY)
+
+        -- CRITICAL: Apply dash movement if it's a dash
+        if effectData.action == "dash" and effectData.targetX and effectData.targetY then
+            -- Dash uses center coordinates
+            self.x = effectData.targetX - self.width/2
+            self.y = effectData.targetY - self.height/2
+            self.centerX = effectData.targetX
+            self.centerY = effectData.targetY
+            self.targetCenterX = effectData.targetX
+            self.targetCenterY = effectData.targetY
+        end
+
         print("NetworkPlayer " .. self.id .. " triggered action effect for " .. effectData.action)
     else
-        print("NetworkPlayer " .. self.id .. " received action for " .. effectData.playerId .. " but my id is " .. self.id)
+        print("NetworkPlayer " .. self.id .. " received action for " ..
+              effectData.playerId .. " but my id is " .. self.id)
     end
 end
 
 function NetworkPlayer:draw()
+    -- Only draw if alive
+    if not self.isAlive then return end
+
     -- Draw a shadow for depth
     love.graphics.setColor(0, 0, 0, 0.3)
     love.graphics.rectangle('fill', self.x + 3, self.y + 5, self.width, self.height)
@@ -162,7 +206,7 @@ function NetworkPlayer:draw()
     love.graphics.rectangle('fill', self.x + 10, self.y + 15, 6, 6)
     love.graphics.rectangle('fill', self.x + 24, self.y + 15, 6, 6)
 
-    -- Draw health bar
+    -- Draw health bar (fades out after damage)
     self:drawHealthBar()
 
     -- Draw name tag above player
@@ -183,13 +227,21 @@ function NetworkPlayer:getCenter()
 end
 
 function NetworkPlayer:getState()
-    return {
-        id = self.id,
-        x = math.floor(self.centerX),
-        y = math.floor(self.centerY),
-        health = self.health,
-        alive = self.isAlive
+    -- Ensure valid state data
+    local state = {
+        id = self.id or "unknown",
+        x = math.floor(self.centerX or 0),
+        y = math.floor(self.centerY or 0),
+        health = self.health or 100,
+        alive = self.isAlive or false
     }
+
+    -- Validate
+    if not (state.x and state.y and state.health) then
+        print("NetworkPlayer: Invalid state for player", self.id)
+    end
+
+    return state
 end
 
 function NetworkPlayer:__tostring()

@@ -1,6 +1,5 @@
 -- src/ui/MainMenu.lua
 -- Main menu screen with host/join functionality
--- Inherits from BaseMenu for common menu functionality
 
 local BaseMenu = require "src.ui.BaseMenu"
 
@@ -33,10 +32,13 @@ function MainMenu:initialize()
     }
 
     -- Initialize base menu with our options
-    BaseMenu.initialize(self, "Main Menu", menuOptions)
+    BaseMenu.initialize(self, "WAVE SURVIVAL", menuOptions)
 
     -- Network module reference (set by main.lua)
     self.network = nil
+
+    -- State change callback (set by main.lua)
+    self.onStateChange = nil
 end
 
 -- Called when "Host Game" is selected
@@ -58,6 +60,11 @@ end
 function MainMenu:onJoinSelected()
     if self.network then
         self:deactivate()
+        -- Set game state to connecting first
+        if self.onStateChange then
+            self.onStateChange("connecting")
+        end
+
         -- IMPORTANT: Directly call Network.init
         local Network = require "src.core.Network"
         Network.init("localhost", 22122, false)
@@ -79,25 +86,31 @@ function MainMenu:draw()
 
     -- Semi-transparent background overlay
     love.graphics.setColor(0, 0, 0, 0.8)
-    love.graphics.rectangle("fill", 100, 50, 600, 500)
+    love.graphics.rectangle("fill", 0, 0, 800, 600)
 
     -- Menu title with centered alignment
     love.graphics.setColor(1, 1, 1)
-    love.graphics.setFont(love.graphics.newFont(24))
+    love.graphics.setFont(love.graphics.newFont(36))
     local titleWidth = love.graphics.getFont():getWidth(self.title)
-    love.graphics.print(self.title, (800 - titleWidth) / 2, 80)
+    love.graphics.print(self.title, (800 - titleWidth) / 2, 100)
+
+    -- Subtitle
+    love.graphics.setFont(love.graphics.newFont(18))
+    love.graphics.print("Multiplayer Wave Survival", 250, 160)
 
     -- Draw menu options with selection indicator
     for i, option in ipairs(self.options) do
-        local y = 150 + (i * 40)
+        local y = 220 + (i * 60)
 
         -- Highlight selected option
         if i == self.selectedIndex then
             love.graphics.setColor(0, 1, 0)  -- Green for selected
-            love.graphics.print("> " .. option.text, 200, y)
+            love.graphics.setFont(love.graphics.newFont(24))
+            love.graphics.print("> " .. option.text, 300, y)
         else
             love.graphics.setColor(0.7, 0.7, 0.7)  -- Gray for unselected
-            love.graphics.print("  " .. option.text, 200, y)
+            love.graphics.setFont(love.graphics.newFont(20))
+            love.graphics.print("  " .. option.text, 300, y)
         end
     end
 
@@ -106,6 +119,11 @@ function MainMenu:draw()
     love.graphics.setFont(love.graphics.newFont(14))
     love.graphics.print("Use UP/DOWN arrows to navigate, ENTER to select", 200, 450)
     love.graphics.print("Press ESC to return/quit", 200, 470)
+
+    -- Game info
+    love.graphics.setColor(0.5, 0.5, 1)
+    love.graphics.print("Host controls waves - Join anytime between waves", 200, 500)
+    love.graphics.print("Survive 10 waves per stage, 10 stages total!", 200, 520)
 end
 
 return MainMenu

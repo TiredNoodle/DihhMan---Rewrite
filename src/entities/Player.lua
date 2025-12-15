@@ -33,6 +33,15 @@ function Player:initialize(name, x, y)
     self.actionStartTime = 0
     self.actionDuration = 0.2
 
+    -- Dash properties
+    self.isDashing = false
+    self.dashProgress = 0
+    self.dashDuration = 0.15  -- 150ms dash duration
+    self.dashTargetX = nil
+    self.dashTargetY = nil
+    self.dashTargetCenterX = nil
+    self.dashTargetCenterY = nil
+
     -- Effect timers
     self.attackEffectTimer = nil
     self.specialEffectTimer = nil
@@ -50,7 +59,31 @@ function Player:update(dt)
     -- Update action effects
     self:updateActionEffects(dt)
 
-    if self.isLocalPlayer then
+    -- Handle dashing
+    if self.isDashing then
+        self.dashProgress = self.dashProgress + dt
+
+        if self.dashProgress >= self.dashDuration then
+            -- Complete dash
+            self.isDashing = false
+            if self.dashTargetX and self.dashTargetY then
+                self.x = self.dashTargetX
+                self.y = self.dashTargetY
+            end
+        else
+            -- Interpolate during dash
+            local t = self.dashProgress / self.dashDuration
+            local startX, startY = self.x, self.y
+
+            if self.dashTargetX and self.dashTargetY then
+                self.x = startX + (self.dashTargetX - startX) * t
+                self.y = startY + (self.dashTargetY - startY) * t
+            end
+        end
+    end
+
+    -- Only handle input if alive and local player
+    if self.isLocalPlayer and self.isAlive and not self.isDashing then
         self:handleInput(dt) -- Process keyboard input
         self:handleActions() -- Process action input
     end
@@ -129,6 +162,11 @@ function Player:performAction(actionName)
         attackDirection = {x = 0, y = -1} -- Default: attack forward (up)
     end
 
+    -- Handle dash separately
+    if actionName == "dash" then
+        return self:performDash()
+    end
+
     -- Create action data to send to server
     -- The server will handle finding targets and applying damage
     local actionData = {
@@ -173,24 +211,74 @@ end
 function Player:performDash()
     local action = self.actions.dash
 
-    -- Dash in current movement direction or last direction
+    -- Don't dash if already dashing
+    if self.isDashing then return end
+
+    -- Calculate dash direction
     local dashX, dashY = 0, 0
-    if math.abs(self.velocity.x) > 0 or math.abs(self.velocity.y) > 0 then
+
+    if self.lastMoveDirection and (self.lastMoveDirection.x ~= 0 or self.lastMoveDirection.y ~= 0) then
+        dashX = self.lastMoveDirection.x
+        dashY = self.lastMoveDirection.y
+    elseif math.abs(self.velocity.x) > 0 or math.abs(self.velocity.y) > 0 then
         -- Normalize velocity for dash direction
         local length = math.sqrt(self.velocity.x^2 + self.velocity.y^2)
-        dashX = (self.velocity.x / length) * action.distance
-        dashY = (self.velocity.y / length) * action.distance
+        dashX = self.velocity.x / length
+        dashY = self.velocity.y / length
     else
-        -- Default dash forward (based on last direction or facing)
-        dashY = -action.distance  -- Dash upward by default
+        -- Default dash forward (up)
+        dashY = -1
     end
 
-    -- Apply dash (temporarily disable collision for dash)
-    local oldCollision = self.collisionEnabled
-    self.collisionEnabled = false
-    self.x = self.x + dashX
-    self.y = self.y + dashY
-    self.collisionEnabled = oldCollision
+    -- Normalize the dash direction
+    local dirLength = math.sqrt(dashX^2 + dashY^2)
+    if dirLength > 0 then
+        dashX = dashX / dirLength
+        dashY = dashY / dirLength
+    end
+
+    -- Calculate dash distance
+    local dashDistance = action.distance * 1.5  -- Increased dash distance
+
+    -- Calculate dash target positions
+    self.dashTargetX = self.x + dashX * dashDistance
+    self.dashTargetY = self.y + dashY * dashDistance
+
+    -- Store center coordinates for network
+    local centerX, centerY = self:getCenter()
+    self.dashTargetCenterX = centerX + dashX * dashDistance
+    self.dashTargetCenterY = centerY + dashY * dashDistance
+
+    -- Start dash
+    self.isDashing = true
+    self.dashProgress = 0
+
+    -- Send dash action to network
+    local actionData = {
+        playerId = self.name,
+        action = "dash",
+        x = centerX,
+        y = centerY,
+        direction = {x = dashX, y = dashY},
+        targetX = self.dashTargetCenterX,  -- Send CENTER coordinates
+        targetY = self.dashTargetCenterY
+    }
+
+    -- Send to network
+    if self.isLocalPlayer and Network then
+        if Network.isServer then
+            -- Host: process locally
+            Network.onPlayerAction(actionData, {getIndex = function() return "host" end})
+        else
+            -- Client: send to server
+            Network.sendPlayerAction(actionData)
+        end
+    end
+
+    -- Trigger local dash effect
+    self:triggerActionEffect("dash", nil, nil, nil)
+
+    return actionData
 end
 
 -- Action effect system - visual only
@@ -264,10 +352,24 @@ function Player:applyActionEffect(effectData)
     -- Trigger the visual effect for this player
     if effectData.action and effectData.playerId == self.name then
         self:triggerActionEffect(effectData.action, effectData.targetId, effectData.targetX, effectData.targetY)
+
+        -- Handle dash movement from network
+        if effectData.action == "dash" and effectData.targetX and effectData.targetY then
+            -- Convert center coordinates to top-left
+            self.x = effectData.targetX - self.width/2
+            self.y = effectData.targetY - self.height/2
+        end
     end
 end
 
+function Player:getCenter()
+    return self.x + self.width/2, self.y + self.height/2
+end
+
 function Player:draw()
+    -- Only draw if alive
+    if not self.isAlive then return end
+
     -- Draw a shadow for depth
     love.graphics.setColor(0, 0, 0, 0.3)
     love.graphics.rectangle('fill', self.x + 3, self.y + 5, self.width, self.height)
@@ -326,37 +428,57 @@ function Player:draw()
     love.graphics.rectangle('fill', self.x + 10, self.y + 15, 6, 6)
     love.graphics.rectangle('fill', self.x + 24, self.y + 15, 6, 6)
 
+    -- Draw health bar (fades out after damage)
+    self:drawHealthBar()
+
     love.graphics.setColor(1, 1, 1)
 end
 
 function Player:getNetworkState()
-    return {
-        x = math.floor(self.x + self.width/2),   -- Send CENTER X
-        y = math.floor(self.y + self.height/2),  -- Send CENTER Y
-        health = self.health,
-        alive = self.isAlive and 1 or 0,
-        actions = {  -- Include action states
-            attack = self.actions.attack.timer,
-            special = self.actions.special.timer,
-            dash = self.actions.dash.timer
-        }
+    -- Ensure we have valid position and health values
+    local centerX = self.x + self.width/2
+    local centerY = self.y + self.height/2
+
+    -- Return only essential data for network transmission
+    local state = {
+        x = math.floor(centerX),   -- Send CENTER X
+        y = math.floor(centerY),   -- Send CENTER Y
+        health = self.health or 100
     }
+
+    -- Debug validation
+    if not (state.x and state.y and state.health) then
+        print("WARNING: Player.getNetworkState returning invalid state for:", self.name)
+        print("  x:", state.x, "y:", state.y, "health:", state.health)
+        print("  self.x:", self.x, "self.y:", self.y, "self.health:", self.health)
+    end
+
+    return state
 end
 
 function Player:applyNetworkState(state)
+    local oldHealth = self.health
+
     -- Convert from center to top-left corner
     self.x = state.x - self.width/2
     self.y = state.y - self.height/2
-    self.health = state.health
-    self.isAlive = (state.alive == 1)
+    self.health = state.health or self.health
 
-    -- Update action cooldowns if provided
-    if state.actions then
-        for actionName, timer in pairs(state.actions) do
-            if self.actions[actionName] then
-                self.actions[actionName].timer = timer or 0
-            end
+    -- CRITICAL FIX: Properly handle death
+    if state.health ~= nil then
+        self.isAlive = state.health > 0
+        if state.health <= 0 then
+            self.isAlive = false
+            self.health = 0
         end
+    end
+
+    -- Show health bar when health changes (network sync)
+    if state.health and state.health < oldHealth then
+        self:showHealthBarTemporarily()
+    elseif state.health and state.health < self.maxHealth then
+        -- If health is less than max, show bar temporarily
+        self:showHealthBarTemporarily()
     end
 end
 
