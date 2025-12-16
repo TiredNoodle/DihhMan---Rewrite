@@ -432,6 +432,13 @@ function Network.init(host, port, serverMode)
             end
         end)
 
+        -- Add modList event handler for client
+        client:on("modList", function(data)
+            if Network.onModListCallback then
+                Network.onModListCallback(data)
+            end
+        end)
+
         client:on("gameState", function(data)
             Network.onGameStateReceived(data)
         end)
@@ -525,6 +532,22 @@ function Network.init(host, port, serverMode)
         print("Client attempting connection...")
     end
 end
+
+-- Mod synchronization
+function Network.syncModsToClient(client)
+    if not Network.isServer or not client then return end
+
+    local modList = {}
+    if _G.MOD_LIST then
+        modList = _G.MOD_LIST
+    end
+
+    client:send("modList", {
+        mods = modList,
+        timestamp = love.timer.getTime()
+    })
+end
+
 
 -- FRAME UPDATE
 function Network.update(dt)
@@ -622,6 +645,9 @@ end
 -- Called when a new client connects to the server
 function Network.onClientConnected(clientObj, data)
     local clientId = tostring(clientObj:getIndex())
+
+    -- Sync mods to new client
+    Network.syncModsToClient(clientObj)
 
     -- Check if we can accept new players
     if not Network.canAcceptPlayers then
@@ -1439,6 +1465,10 @@ end
 -- CALLBACK REGISTRATION FUNCTIONS
 function Network.setConnectCallback(callback)
     Network.onConnectCallback = callback
+end
+
+function Network.setModListCallback(callback)
+    Network.onModListCallback = callback
 end
 
 function Network.setGameStateCallback(callback)
