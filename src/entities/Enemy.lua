@@ -101,8 +101,69 @@ function EnemyFactory.create(name, x, y, enemyType)
         return closestPlayer, closestDistance
     end
 
+    function Enemy:applyNetworkState(state)
+        if not state then return end
+
+        local oldHealth = self.health
+
+        if state.x and state.y then
+            -- Store target instead of snapping for smooth interpolation
+            self.targetX = state.x - self.width/2
+            self.targetY = state.y - self.height/2
+            
+            -- Initialize position if this is the first update (or reset)
+            if not self.x then
+               self.x = self.targetX
+               self.y = self.targetY
+            end
+
+            -- Teleport if distance is too large (lag spike or spawn)
+            local dx = self.targetX - self.x
+            local dy = self.targetY - self.y
+            if (dx*dx + dy*dy) > (100*100) then
+                self.x = self.targetX
+                self.y = self.targetY
+            end
+        end
+
+        if state.health then
+            self.health = state.health
+        end
+
+        if state.maxHealth then
+            self.maxHealth = state.maxHealth
+        end
+
+        if state.id then
+            self.enemyId = state.id
+        end
+
+        if state.type and state.type ~= self.type then
+            self.type = state.type
+            self:applyTypeProperties()
+        end
+
+        if state.alive ~= nil then
+            self.isAlive = (state.alive == 1) or state.alive == true
+        elseif state.health then
+            self.isAlive = state.health > 0
+        end
+
+        if state.health and state.health < oldHealth then
+            self:showHealthBarTemporarily()
+        end
+    end
+
     function Enemy:update(dt, players)
         if not self.isAlive then return end
+        
+        -- Interpolate position if network target is present
+        if self.targetX and self.targetY then
+            local lerpSpeed = 10.0
+            self.x = self.x + (self.targetX - self.x) * lerpSpeed * dt
+            self.y = self.y + (self.targetY - self.y) * lerpSpeed * dt
+        end
+        
         BaseCharacter.update(self, dt)
 
         -- Ensure attackTimer exists
@@ -111,16 +172,37 @@ function EnemyFactory.create(name, x, y, enemyType)
             self.attackTimer = self.attackTimer - dt
         end
 
-        if players and #players > 0 then
-            local target, distance = self:findTarget(players)
-            if target and target.isAlive then
-                self.targetPlayer = target
-                self:chase(target, dt, distance)
+        -- Only run AI logic if we don't have network targets (or if we are the host/standalone)
+        -- In this simple implementation, clients might just follow interpolation
+        -- But if 'update' allows AI to override interpolation, we need to be careful.
+        -- Assuming 'update' is run on both client and server:
+        -- Server runs AI -> sets self.x/y -> sends network packet
+        -- Client gets packet -> sets targetX/targetY -> lerps
+        
+        -- We should suppress local AI movement on clients if we are interpolating
+        -- But 'players' argument implies we might be running AI.
+        -- Let's check typical usage. In main.lua:
+        -- Server: runs full update. Clients: run update.
+        -- Modifying update() effectively changes it for both.
+        -- However, BaseCharacter:update applies velocity.
+        -- If we reuse 'move' for AI, it sets velocity.
+        -- Conflict: Interpolation sets x/y directly. AI sets velocity.
+        
+        -- Fix: On clients (if we have targets), skip AI movement logic
+        if self.targetX and self.targetY and _G.Network and not _G.Network.isServer then
+             -- Pure interpolation, no AI chase
+        else
+             if players and #players > 0 then
+                local target, distance = self:findTarget(players)
+                if target and target.isAlive then
+                    self.targetPlayer = target
+                    self:chase(target, dt, distance)
+                else
+                    self:randomWander(dt)
+                end
             else
                 self:randomWander(dt)
             end
-        else
-            self:randomWander(dt)
         end
     end
 
@@ -213,43 +295,7 @@ function EnemyFactory.create(name, x, y, enemyType)
         }
     end
 
-    function Enemy:applyNetworkState(state)
-        if not state then return end
 
-        local oldHealth = self.health
-
-        if state.x and state.y then
-            self.x = state.x - self.width/2
-            self.y = state.y - self.height/2
-        end
-
-        if state.health then
-            self.health = state.health
-        end
-
-        if state.maxHealth then
-            self.maxHealth = state.maxHealth
-        end
-
-        if state.id then
-            self.enemyId = state.id
-        end
-
-        if state.type and state.type ~= self.type then
-            self.type = state.type
-            self:applyTypeProperties()
-        end
-
-        if state.alive ~= nil then
-            self.isAlive = (state.alive == 1) or state.alive == true
-        elseif state.health then
-            self.isAlive = state.health > 0
-        end
-
-        if state.health and state.health < oldHealth then
-            self:showHealthBarTemporarily()
-        end
-    end
 
     -- Create and return the instance
     return Enemy:new(name, x, y, enemyType)
