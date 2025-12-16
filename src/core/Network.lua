@@ -1,5 +1,5 @@
 -- src/core/Network.lua
--- Main networking module for wave survival game
+-- Main networking module for wave survival game - Updated with two-way mod validation
 
 local sock = require "lib.sock"
 local bitser = require "lib.bitser"
@@ -400,6 +400,11 @@ function Network.init(host, port, serverMode)
             Network.onClientDisconnected(clientObj, data)
         end)
 
+        -- NEW: Client mod list handler
+        server:on("clientModList", function(data, clientObj)
+            Network.onClientModList(data, clientObj)
+        end)
+
         print("Server started. Waiting for connections...")
 
         -- Add host to game
@@ -434,9 +439,12 @@ function Network.init(host, port, serverMode)
 
         -- Add modList event handler for client
         client:on("modList", function(data)
-            if Network.onModListCallback then
-                Network.onModListCallback(data)
-            end
+            Network.onModListReceived(data)
+        end)
+
+        -- NEW: Mod validation result from server
+        client:on("modValidation", function(data)
+            Network.onModValidationReceived(data)
         end)
 
         client:on("gameState", function(data)
@@ -533,21 +541,126 @@ function Network.init(host, port, serverMode)
     end
 end
 
--- Mod synchronization
+-- NEW: Two-way mod synchronization
 function Network.syncModsToClient(client)
     if not Network.isServer or not client then return end
 
-    local modList = {}
-    if _G.MOD_LIST then
-        modList = _G.MOD_LIST
+    -- Get ALL mods (enabled and disabled)
+    local allMods = {}
+    if _G.MOD_API then
+        allMods = _G.MOD_API.getAllModsList()
+    elseif _G.MOD_ALL then
+        allMods = _G.MOD_ALL
     end
 
+    -- Send mod list to client
     client:send("modList", {
-        mods = modList,
+        mods = allMods,
         timestamp = love.timer.getTime()
     })
 end
 
+-- NEW: Handle client mod list (server-side)
+function Network.onClientModList(data, clientObj)
+    if not Network.isServer or not server then return end
+
+    local clientId = tostring(clientObj:getIndex())
+    print("Server: Received mod list from client:", clientId)
+
+    if _G.MOD_API then
+        local success, message, details = _G.MOD_API.validateClientMods(data.mods, clientId)
+
+        if success then
+            print("Server: Client mods validated successfully for:", clientId)
+
+            -- Send validation result back to client
+            clientObj:send("modValidation", {
+                status = "accepted",
+                message = "Mods validated successfully",
+                details = details
+            })
+
+            -- FIX: Send initial game state to the new client so they can create their localPlayer
+            -- The client needs to know the world state now that it's validated
+            local gameState = getGameState()
+            MessageHandler:configureSendMode(clientObj, "gameState")
+            clientObj:send("gameState", {
+                players = gameState.players,
+                enemies = gameState.enemies,
+                yourId = clientId, -- Send ID again to be sure (though they should have it)
+                gameActive = Network.gameActive,
+                waveStatus = gameState.waveStatus
+            })
+            print("Server: Sent initial game state to validated client:", clientId)
+        else
+            print("Server: Client mod validation FAILED for:", clientId, "-", message)
+
+            -- Send rejection to client
+            clientObj:send("modValidation", {
+                status = "rejected",
+                message = message,
+                details = details
+            })
+
+            -- Disconnect incompatible client
+            clientObj:disconnect()
+
+            -- Broadcast to other clients
+            for id, player in pairs(Network.connectedPlayers) do
+                if id ~= clientId and player and player.client then
+                    player.client:send("playerLeft", {
+                        id = clientId,
+                        reason = "mod_incompatibility",
+                        message = "Incompatible mods"
+                    })
+                end
+            end
+        end
+    else
+        print("Server: No MOD_API available, accepting client:", clientId)
+        clientObj:send("modValidation", {
+            status = "accepted",
+            message = "No mod validation available"
+        })
+    end
+end
+
+-- NEW: Client receives server mod list
+function Network.onModListReceived(data)
+    print("Client: Received mod list from server")
+
+    -- Store server mod list
+    Network.serverModList = data.mods
+
+    if Network.onModListCallback then
+        Network.onModListCallback(data)
+    end
+
+    -- Send our mod list to server
+    if client and client:isConnected() then
+        local clientMods = {}
+        if _G.MOD_API then
+            clientMods = _G.MOD_API.getAllModsList()
+        elseif _G.MOD_LIST then
+            clientMods = _G.MOD_LIST
+        end
+
+        MessageHandler:configureSendMode(client, "clientModList")
+        client:send("clientModList", {
+            mods = clientMods,
+            timestamp = love.timer.getTime()
+        })
+    end
+end
+
+-- NEW: Client receives mod validation result
+function Network.onModValidationReceived(data)
+    print("Client: Received mod validation from server:", data.status)
+
+    if Network.onModValidationCallback then
+        Network.onModValidationCallback(data)
+    end
+end
 
 -- FRAME UPDATE
 function Network.update(dt)
@@ -646,71 +759,37 @@ end
 function Network.onClientConnected(clientObj, data)
     local clientId = tostring(clientObj:getIndex())
 
-    -- Sync mods to new client
-    Network.syncModsToClient(clientObj)
-
     -- Check if we can accept new players
     if not Network.canAcceptPlayers then
         print("Server: Rejecting new player - wave in progress")
+        clientObj:send("modValidation", {
+            status = "rejected",
+            message = "Cannot join during active wave"
+        })
         clientObj:disconnect()
         return
     end
 
     print("Server: Client connected with ID:", clientId)
 
-    -- Find a valid spawn location
-    local spawnX, spawnY = World.findSpawnLocation()
+    -- Sync mods to new client (two-way)
+    Network.syncModsToClient(clientObj)
 
-    -- Store player data with client object
+    -- Store client object for later use
     Network.connectedPlayers[clientId] = {
         client = clientObj,  -- Store the client object
         id = clientId,
-        x = spawnX,
-        y = spawnY,
+        x = 400,  -- Temporary position
+        y = 300,
         health = 100,
-        lastSentX = spawnX,
-        lastSentY = spawnY
+        lastSentX = 400,
+        lastSentY = 300
     }
 
     -- Send the client its player ID
     clientObj:send("playerId", {id = clientId})
 
-    -- Add to persistent states
-    Network.persistentPlayerStates[clientId] = {
-        id = clientId,
-        x = spawnX,
-        y = spawnY,
-        health = 100,
-        alive = true
-    }
-
-    -- Broadcast updated game state to ALL clients
-    broadcastGameState()
-
-    -- Notify other players about new player
-    for id, player in pairs(Network.connectedPlayers) do
-        if id ~= clientId and player and player.client then
-            MessageHandler:configureSendMode(player.client, "playerJoined")
-            player.client:send("playerJoined", {
-                id = clientId,
-                x = spawnX,
-                y = spawnY,
-                health = 100
-            })
-        end
-    end
-
-    -- Notify host
-    if Network.onPlayerJoinedCallback then
-        Network.onPlayerJoinedCallback({
-            id = clientId,
-            x = spawnX,
-            y = spawnY,
-            health = 100
-        })
-    end
-
-    print("Server: Player", clientId, "joined the game")
+    print("Server: Waiting for mod list from client:", clientId)
 end
 
 -- Called when host wants to start game
@@ -1469,6 +1548,10 @@ end
 
 function Network.setModListCallback(callback)
     Network.onModListCallback = callback
+end
+
+function Network.setModValidationCallback(callback)
+    Network.onModValidationCallback = callback
 end
 
 function Network.setGameStateCallback(callback)

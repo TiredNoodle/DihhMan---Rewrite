@@ -14,6 +14,22 @@ function modLoader.loadMods()
         return {}
     end
 
+    -- Load mod preferences
+    local modPreferences = {}
+    local prefsFile = "mod_preferences.lua"
+    if love.filesystem.getInfo(prefsFile) then
+        local chunk = love.filesystem.load(prefsFile)
+        local success, prefs = pcall(chunk)
+        if success and type(prefs) == "table" then
+            modPreferences = prefs
+            print("Loaded mod preferences from file")
+        else
+            print("Could not load mod preferences, using defaults")
+        end
+    else
+        print("No mod preferences file found, using defaults")
+    end
+
     -- Load mod API first
     local ModAPI = require("mods.modapi")
     ModAPI.init()
@@ -22,6 +38,9 @@ function modLoader.loadMods()
     local items = love.filesystem.getDirectoryItems(modsDir)
     local loadedMods = {}
     local modQueue = {}
+
+    -- Track ALL mods found (enabled and disabled)
+    local allModsFound = {}
 
     -- First pass: collect mod info and check dependencies
     for _, modFolder in ipairs(items) do
@@ -37,15 +56,62 @@ function modLoader.loadMods()
                 local success, config = pcall(configChunk)
 
                 if success and config then
-                    -- Store mod in queue
-                    modQueue[modFolder] = {
-                        path = modPath,
-                        config = config,
+                    -- Store mod info in all mods list
+                    allModsFound[modFolder] = {
+                        name = config.name or modFolder,
+                        version = config.version or "1.0",
+                        description = config.description or "",
+                        author = config.author or "Unknown",
+                        requiresSync = config.requiresSync or false,
                         dependencies = config.dependencies or {},
-                        loaded = false
+                        config = config
                     }
+
+                    -- Check if mod is enabled in preferences
+                    local enabled = modPreferences[modFolder]
+                    if enabled == nil then
+                        enabled = true  -- Default to enabled if not specified
+                    end
+
+                    -- Only queue enabled mods for loading
+                    if enabled then
+                        -- Store mod in queue
+                        modQueue[modFolder] = {
+                            path = modPath,
+                            config = config,
+                            dependencies = config.dependencies or {},
+                            loaded = false
+                        }
+                        print(string.format("  Mod '%s' is ENABLED", config.name or modFolder))
+                    else
+                        print(string.format("  Mod '%s' is DISABLED (skipping)", config.name or modFolder))
+                    end
                 end
             end
+        end
+    end
+
+    -- Register ALL mods with ModAPI (enabled and disabled)
+    for modFolder, modInfo in pairs(allModsFound) do
+        local enabled = modPreferences[modFolder]
+        if enabled == nil then
+            enabled = true  -- Default to enabled
+        end
+
+        if enabled then
+            ModAPI.registerLoadedMod(modFolder, {
+                name = modInfo.name,
+                version = modInfo.version,
+                description = modInfo.description,
+                requiresSync = modInfo.requiresSync
+            }, true)
+        else
+            ModAPI.registerDisabledMod(modFolder, {
+                name = modInfo.name,
+                version = modInfo.version,
+                description = modInfo.description,
+                requiresSync = modInfo.requiresSync
+            })
         end
     end
 
@@ -106,14 +172,6 @@ function modLoader.loadMods()
                     loadedMods[modName] = modData.config
                     table.insert(modLoadOrder, modName)
 
-                    -- Register with ModAPI
-                    ModAPI.registerLoadedMod(modName, {
-                        name = modData.config.name or modName,
-                        version = modData.config.version or "1.0",
-                        description = modData.config.description or "",
-                        requiresSync = modData.config.requiresSync or false
-                    })
-
                     loadedThisRound = true
                 end
             end
@@ -133,7 +191,9 @@ function modLoader.loadMods()
     end
 
     print("\n=== Mod Loading Complete ===")
+    print("Total mods found:", tableCount(allModsFound))
     print("Total mods loaded:", #modLoadOrder)
+    print("Total mods disabled:", tableCount(allModsFound) - #modLoadOrder)
 
     -- Print loaded content summary
     for category, content in pairs(_G.MOD_REGISTRY) do
