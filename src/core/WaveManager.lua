@@ -6,23 +6,24 @@ local class = require "lib.middleclass"
 local registeredEnemyTypes = {
     melee = {
         class = nil,  -- Will be set when loading Enemy.lua
-        data = { display_name = "Melee Enemy", spawn_weight = 1.0 }
+        data = { display_name = "Melee Enemy", spawn_weight = 1.0, requiresSync = false }
     },
     ranged = {
         class = nil,
-        data = { display_name = "Ranged Enemy", spawn_weight = 0.5 }
+        data = { display_name = "Ranged Enemy", spawn_weight = 0.5, requiresSync = false }
     },
     boss = {
         class = nil,
-        data = { display_name = "Boss", spawn_weight = 0.1, min_wave = 5 }
+        data = { display_name = "Boss", spawn_weight = 0.1, min_wave = 5, requiresSync = false }
     }
 }
 
 local WaveManager = class('WaveManager')
 
-function WaveManager:initialize()
+function WaveManager:initialize(isServer)
+    self.isServer = isServer or false
     self.currentStage = 1
-    self.currentWave = 1  -- CHANGED: Start from wave 1
+    self.currentWave = 1
     self.isWaveActive = false
     self.waveCountdown = 0
     self.totalEnemies = 0
@@ -31,10 +32,9 @@ function WaveManager:initialize()
     self.awaitingConfirmation = false
     self.gameActive = false
     self.lastEnemySpawnTime = 0
-    self.enemySpawnInterval = 0.8  -- Spawn enemies every 0.8 seconds during wave
+    self.enemySpawnInterval = 0.8
 
     -- Wave configurations for each stage (Stage I, Stage II, etc.)
-    -- Each stage has 10 waves
     self.wavesPerStage = 10
     self.waveConfigs = {}
 
@@ -43,10 +43,11 @@ function WaveManager:initialize()
 
     print("WaveManager initialized. Starting at Wave 1.")
 
-    -- Load modded enemies if they exist
-    if _G.MOD_ENEMIES then
-        for typeName, def in pairs(_G.MOD_ENEMIES) do
-            self:registerEnemyType(typeName, def)
+    -- Load modded enemies if they exist (only on server or singleplayer)
+    if _G.MOD_REGISTRY and _G.MOD_REGISTRY.enemies then
+        for typeName, enemyDef in pairs(_G.MOD_REGISTRY.enemies) do
+            self:registerEnemyType(typeName, enemyDef)
+            print("WaveManager: Registered modded enemy type:", typeName)
         end
     end
 end
@@ -116,7 +117,7 @@ end
 
 function WaveManager:startGame()
     self.currentStage = 1
-    self.currentWave = 1  -- CHANGED: Start at wave 1
+    self.currentWave = 1
     self.isWaveActive = false
     self.gameActive = true
     self.totalEnemies = 0
@@ -171,14 +172,13 @@ function WaveManager:update(dt)
     return nil
 end
 
--- Start the current wave (used after countdown or confirmation)
 function WaveManager:startCurrentWave()
     local config = self.waveConfigs[self.currentStage][self.currentWave]
     self.totalEnemies = config.enemies
-    self.enemiesAlive = 0  -- Will increase as enemies spawn
+    self.enemiesAlive = 0
     self.enemiesSpawned = 0
     self.isWaveActive = true
-    self.awaitingConfirmation = false  -- Not awaiting confirmation when wave is active
+    self.awaitingConfirmation = false
     self.lastEnemySpawnTime = 0
 
     return {
@@ -203,11 +203,10 @@ end
 function WaveManager:completeWave()
     self.isWaveActive = false
 
-    -- Get the wave we just completed
     local completedWave = self.currentWave
     local completedStage = self.currentStage
 
-    -- ADVANCE TO NEXT WAVE - CRITICAL FIX
+    -- ADVANCE TO NEXT WAVE
     self.currentWave = self.currentWave + 1
     if self.currentWave > self.wavesPerStage then
         self.currentStage = self.currentStage + 1
@@ -218,11 +217,9 @@ function WaveManager:completeWave()
     local nextWaveRequiresConfirmation = (self.currentWave % 3 == 0)
 
     if nextWaveRequiresConfirmation then
-        -- Next wave requires confirmation
         self.awaitingConfirmation = true
-        self.waveCountdown = 0  -- No auto-countdown
+        self.waveCountdown = 0
     else
-        -- Next wave will auto-start after 5 seconds
         self.awaitingConfirmation = false
         self.waveCountdown = 5
     end
@@ -252,8 +249,8 @@ function WaveManager:completeWave()
     end
 
     return {
-        stage = completedStage,  -- Return the wave we just completed
-        wave = completedWave,    -- Return the wave we just completed
+        stage = completedStage,
+        wave = completedWave,
         completed = true,
         gameCompleted = false,
         awaitingConfirmation = self.awaitingConfirmation,
@@ -299,7 +296,7 @@ function WaveManager:spawnEnemy(currentTime)
 
     -- Select random enemy
     local rand = love.math.random() * totalWeight
-    local selectedType = "melee"  -- Default
+    local selectedType = "melee"
 
     for _, entry in ipairs(weightedList) do
         if rand <= entry.cumWeight then
@@ -335,7 +332,7 @@ end
 
 function WaveManager:reset()
     self.currentStage = 1
-    self.currentWave = 1  -- CHANGED: Reset to wave 1
+    self.currentWave = 1
     self.isWaveActive = false
     self.gameActive = false
     self.waveCountdown = 0
@@ -343,6 +340,16 @@ function WaveManager:reset()
     self.enemiesAlive = 0
     self.enemiesSpawned = 0
     self.awaitingConfirmation = false
+end
+
+-- Get enemy definition for network sync
+function WaveManager:getEnemyDefinition(enemyType)
+    return registeredEnemyTypes[enemyType]
+end
+
+-- Get all registered enemy types for network sync
+function WaveManager:getAllEnemyTypes()
+    return registeredEnemyTypes
 end
 
 return WaveManager

@@ -1,4 +1,6 @@
 -- mods/sample_enemy/enemy.lua
+-- Multiplayer-compatible fast enemy
+
 local BaseCharacter = require "src.entities.BaseCharacter"
 
 local SampleFastEnemy = BaseCharacter:subclass('SampleFastEnemy')
@@ -32,12 +34,12 @@ function SampleFastEnemy:update(dt, players)
         local closestDist = math.huge
 
         for _, player in ipairs(players) do
-            if player.isAlive then
+            if player and player.isAlive then
                 local dx = player.x - self.x
                 local dy = player.y - self.y
                 local dist = math.sqrt(dx*dx + dy*dy)
 
-                if dist < closestDist and dist < self.aggroRange then
+                if dist < closestDist and dist < (self.aggroRange or 350) then
                     closestDist = dist
                     target = player
                 end
@@ -54,9 +56,57 @@ function SampleFastEnemy:update(dt, players)
                 dx = dx / dist
                 dy = dy / dist
                 self:move(dx, dy)
+
+                -- Check for attack with defensive checks
+                local attackRange = self.attackRange or 40
+                local attackTimer = self.attackTimer or 0
+                if dist < attackRange and attackTimer <= 0 then
+                    if target.takeDamage then
+                        target:takeDamage(self.damage or 15)
+                        self.attackTimer = self.attackCooldown or 1.5
+                    end
+                end
             end
         end
     end
+
+    -- Update attack timer with defensive check
+    if self.attackTimer and self.attackTimer > 0 then
+        self.attackTimer = self.attackTimer - dt
+    end
+end
+
+function SampleFastEnemy:draw()
+    if not self.isAlive then return end
+
+    -- Draw shadow
+    love.graphics.setColor(0, 0, 0, 0.3)
+    love.graphics.rectangle('fill', self.x + 3, self.y + 5, self.width, self.height)
+
+    -- Draw main body with pulsing effect
+    local pulse = (math.sin(love.timer.getTime() * 5) + 1) * 0.1
+    local color = self.color or {0, 1, 0.5}
+    love.graphics.setColor(
+        color[1] + pulse,
+        color[2] + pulse,
+        color[3] + pulse
+    )
+    love.graphics.rectangle('fill', self.x, self.y, self.width, self.height)
+
+    -- Draw eyes
+    love.graphics.setColor(1, 1, 1)
+    love.graphics.rectangle('fill', self.x + 8, self.y + 12, 5, 5)
+    love.graphics.rectangle('fill', self.x + 22, self.y + 12, 5, 5)
+
+    -- Draw speed lines when moving fast
+    if math.abs(self.velocity.x) > 50 or math.abs(self.velocity.y) > 50 then
+        love.graphics.setColor(1, 1, 1, 0.3)
+        love.graphics.rectangle('fill', self.x - 5, self.y, 5, self.height)
+        love.graphics.rectangle('fill', self.x + self.width, self.y, 5, self.height)
+    end
+
+    self:drawHealthBar()
+    love.graphics.setColor(1, 1, 1)
 end
 
 return {
@@ -64,7 +114,8 @@ return {
     enemy_data = {
         type = "sample_fast",
         display_name = "Fast Runner",
-        spawn_weight = 0.3,  -- 30% chance to spawn instead of regular enemy
-        min_wave = 3  -- Start appearing from wave 3
+        spawn_weight = 0.3,
+        min_wave = 3,
+        requiresSync = true  -- Important for multiplayer
     }
 }

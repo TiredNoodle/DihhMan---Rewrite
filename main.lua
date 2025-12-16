@@ -65,6 +65,19 @@ function love.load()
     World.init()
     hostControl = HostControl:new()
 
+    -- Load mods BEFORE network initialization
+    print("\n=== Loading Mods ===")
+    local success, modLoader = pcall(require, "mods.mod_loader")
+    if success then
+        local loadedMods = modLoader.loadMods()
+        print("Total mods loaded:", tableCount(loadedMods))
+
+        -- Store ModAPI globally for network access
+        _G.MOD_API = require("mods.modapi")
+    else
+        print("Note: Mod system not available")
+    end
+
     -- Create main menu
     mainMenu = MainMenu:new()
     mainMenu.network = Network
@@ -75,16 +88,20 @@ function love.load()
     -- Configure network event callbacks
     setupNetworkCallbacks()
 
+    -- Add mod list callback to network
+    Network.setModListCallback(function(data)
+        print("Received mod list from server")
+        if _G.MOD_API then
+            local success, message = _G.MOD_API.validateClientMods(data.mods)
+            if not success then
+                print("MOD WARNING:", message)
+                -- You could show a warning to the player here
+            end
+        end
+    end)
+
     -- Start in menu state
     switchGameState("menu")
-
-    -- Load mods
-    local success, modLoader = pcall(require, "mods.mod_loader")
-    if success then
-        modLoader.loadMods()
-    else
-        print("Note: Mod system not available")
-    end
 
     print("Game loaded successfully. Press F1 to toggle debug info.")
 end
@@ -396,11 +413,12 @@ function createEnemy(enemyId, data)
         return
     end
 
-    local Enemy = require "src.entities.Enemy"
+    -- FIX: Enemy.lua returns a factory function, not a class
+    local createEnemyFunc = require "src.entities.Enemy"
 
     -- CRITICAL FIX: Create enemy with correct parameters
     -- data.x and data.y are center coordinates from network
-    local enemy = Enemy:new("Enemy_" .. enemyId, data.x, data.y, data.type)
+    local enemy = createEnemyFunc("Enemy_" .. enemyId, data.x, data.y, data.type)
 
     -- Set properties from network data
     enemy.health = data.health or 100
