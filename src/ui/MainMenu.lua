@@ -23,6 +23,13 @@ function MainMenu:initialize()
             end
         },
         {
+            text = "Mod Manager",
+            callback = function()
+                print("Main Menu: Mod Manager selected")
+                self:onModManagerSelected()
+            end
+        },
+        {
             text = "Exit",
             callback = function()
                 print("Main Menu: Exit selected")
@@ -39,6 +46,9 @@ function MainMenu:initialize()
 
     -- State change callback (set by main.lua)
     self.onStateChange = nil
+
+    -- Mod manager callback
+    self.onModManagerCallback = nil
 end
 
 -- Called when "Host Game" is selected
@@ -72,6 +82,15 @@ function MainMenu:onJoinSelected()
         -- Client will wait for server connection
     else
         print("ERROR: Network module not connected to menu")
+    end
+end
+
+-- Called when "Mod Manager" is selected
+function MainMenu:onModManagerSelected()
+    if self.onModManagerCallback then
+        self.onModManagerCallback()
+    else
+        print("ERROR: Mod Manager callback not set")
     end
 end
 

@@ -20,6 +20,11 @@ local hostControl = nil           -- Host control UI
 local debugFont = nil             -- Font for debug information display
 local showDebugInfo = true        -- Toggles debug overlay
 
+-- Mod sync error tracking
+local modSyncError = nil
+local modSyncErrorMessage = ""
+local modSyncErrorTimer = 0
+
 -- Track enemy creation timestamps to prevent duplicate creation
 local enemyCreationTimestamps = {}
 
@@ -85,20 +90,21 @@ function love.load()
         switchGameState(state)
     end
 
+    -- Add mod manager callback
+    mainMenu.onModManagerCallback = function()
+        -- Create and show mod manager menu
+        local ModManagerMenu = require("src.ui.ModManagerMenu")
+        modManagerMenu = ModManagerMenu:new()
+        modManagerMenu.onReturnToMain = function()
+            modManagerMenu:hide()
+            mainMenu:activate()
+        end
+        modManagerMenu:show()
+        mainMenu:deactivate()
+    end
+
     -- Configure network event callbacks
     setupNetworkCallbacks()
-
-    -- Add mod list callback to network
-    Network.setModListCallback(function(data)
-        print("Received mod list from server")
-        if _G.MOD_API then
-            local success, message = _G.MOD_API.validateClientMods(data.mods)
-            if not success then
-                print("MOD WARNING:", message)
-                -- You could show a warning to the player here
-            end
-        end
-    end)
 
     -- Start in menu state
     switchGameState("menu")
@@ -332,6 +338,49 @@ function setupNetworkCallbacks()
         cleanupGame()
         switchGameState("menu")
     end)
+
+    -- Mod synchronization callbacks
+    Network.setModListCallback(function(data)
+        print("Network: Received mod list from server")
+        if _G.MOD_API then
+            local modState = _G.MOD_API.getModConnectionState(_G.MOD_LIST, data.mods)
+
+            if not modState.compatible then
+                modSyncError = true
+                modSyncErrorMessage = "MOD ERROR: " .. modState.errorMessage
+                modSyncErrorTimer = 10.0  -- Show for 10 seconds
+
+                print(modSyncErrorMessage)
+
+                -- Disconnect from server
+                Network.disconnect()
+                switchGameState("menu")
+            else
+                print("Mods validated successfully!")
+
+                -- Show warnings if any
+                if modState.warningMessage and modState.warningMessage ~= "" then
+                    print("MOD WARNING: " .. modState.warningMessage)
+                    modSyncErrorMessage = "MOD WARNING: " .. modState.warningMessage
+                    modSyncErrorTimer = 5.0  -- Show for 5 seconds
+                end
+            end
+        end
+    end)
+
+    Network.setModValidationCallback(function(data)
+        print("Network: Server validated our mods:", data.status)
+        if data.status == "rejected" then
+            modSyncError = true
+            modSyncErrorMessage = "Server rejected connection: " .. (data.message or "Mod incompatibility")
+            modSyncErrorTimer = 10.0
+            Network.disconnect()
+            switchGameState("menu")
+        elseif data.status == "warning" then
+            modSyncErrorMessage = "MOD WARNING: " .. (data.message or "")
+            modSyncErrorTimer = 5.0
+        end
+    end)
 end
 
 -- PLAYER CREATION FUNCTIONS
@@ -515,7 +564,22 @@ function love.update(dt)
     end
 
     if gameState == "menu" then
-        if mainMenu then mainMenu:update(dt) end
+      -- Update ModManagerMenu if visible
+      if modManagerMenu and modManagerMenu.visible then
+          modManagerMenu:update(dt)
+      elseif mainMenu then
+          mainMenu:update(dt)
+      end
+
+      -- Update mod sync error timer
+      if modSyncErrorTimer > 0 then
+          modSyncErrorTimer = modSyncErrorTimer - dt
+          if modSyncErrorTimer <= 0 then
+              modSyncErrorTimer = 0
+              modSyncError = false
+              modSyncErrorMessage = ""
+          end
+      end
     elseif gameState == "connecting" then
         -- Nothing to update while connecting
     elseif gameState == "playing" then
@@ -526,7 +590,8 @@ function love.update(dt)
         PositionSync.update(dt)
 
         -- Update local player and send state to server (OPTIMIZED: Only send on change)
-        if localPlayer and localPlayer.isAlive then
+        -- FIX: Removed localPlayer.isAlive check to allow sending the final death state (health=0)
+        if localPlayer then
             localPlayer:update(dt)
 
             if Network.isConnected() and localPlayer.isLocalPlayer then
@@ -650,7 +715,48 @@ function love.draw()
     World.draw()
 
     if gameState == "menu" then
-        if mainMenu then mainMenu:draw() end
+        -- Draw mod sync error message if present
+        if modSyncErrorTimer > 0 and modSyncErrorMessage ~= "" then
+            love.graphics.setColor(1, 0, 0, 0.8)
+            love.graphics.rectangle("fill", 100, 100, 600, 100)
+            love.graphics.setColor(1, 1, 1)
+            love.graphics.setFont(love.graphics.newFont(16))
+
+            -- Split long messages
+            local words = {}
+            for word in modSyncErrorMessage:gmatch("%S+") do
+                table.insert(words, word)
+            end
+
+            local lines = {}
+            local currentLine = ""
+            for _, word in ipairs(words) do
+                if #currentLine + #word < 60 then
+                    if currentLine ~= "" then
+                        currentLine = currentLine .. " " .. word
+                    else
+                        currentLine = word
+                    end
+                else
+                    table.insert(lines, currentLine)
+                    currentLine = word
+                end
+            end
+            if currentLine ~= "" then
+                table.insert(lines, currentLine)
+            end
+
+            for i, line in ipairs(lines) do
+                love.graphics.print(line, 120, 120 + (i-1) * 20)
+            end
+        end
+
+        -- Check if ModManagerMenu is visible
+        if modManagerMenu and modManagerMenu.visible then
+            modManagerMenu:draw()
+        elseif mainMenu then
+            mainMenu:draw()
+        end
     elseif gameState == "connecting" then
         love.graphics.setColor(0, 0, 0, 0.8)
         love.graphics.rectangle("fill", 0, 0, 800, 600)
@@ -764,7 +870,15 @@ function love.keypressed(key)
         if gameState == "playing" then
             switchGameState("menu")
         elseif gameState == "menu" then
-            love.event.quit()
+            -- If ModManagerMenu is visible, hide it
+            if modManagerMenu and modManagerMenu.visible then
+                modManagerMenu:hide()
+                if modManagerMenu.onReturnToMain then
+                    modManagerMenu.onReturnToMain()
+                end
+            else
+                love.event.quit()
+            end
         end
     elseif key == "f1" then
         showDebugInfo = not showDebugInfo
@@ -793,13 +907,18 @@ function love.keypressed(key)
     end
 
     -- State-specific key handling
-    if gameState == "menu" and mainMenu then
-        if key == "up" then
-            mainMenu:selectPrevious()
-        elseif key == "down" then
-            mainMenu:selectNext()
-        elseif key == "return" then
-            mainMenu:selectCurrent()
+    if gameState == "menu" then
+        -- Handle ModManagerMenu input if visible
+        if modManagerMenu and modManagerMenu.visible then
+            modManagerMenu:keypressed(key)
+        elseif mainMenu then
+            if key == "up" then
+                mainMenu:selectPrevious()
+            elseif key == "down" then
+                mainMenu:selectNext()
+            elseif key == "return" then
+                mainMenu:selectCurrent()
+            end
         end
     elseif gameState == "playing" then
         -- Host controls - UPDATED
