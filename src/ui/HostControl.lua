@@ -57,7 +57,7 @@ function HostControl:draw()
         love.graphics.print(countdownText, 20, 85)
     end
 
-    -- Draw current message
+    -- Draw current message - UPDATED with wrapping
     if self.message ~= "" then
         local messageColor = self.textColor
 
@@ -70,27 +70,52 @@ function HostControl:draw()
         end
 
         love.graphics.setColor(messageColor)
-        love.graphics.print(self.message, 20, 105)
+        -- Wrap long messages
+        local maxWidth = 300
+        local lines = {}
+        local words = self.message:gmatch("%S+")
+        local currentLine = ""
+
+        for word in words do
+            local testLine = currentLine .. (currentLine == "" and "" or " ") .. word
+            if love.graphics.getFont():getWidth(testLine) < maxWidth then
+                currentLine = testLine
+            else
+                table.insert(lines, currentLine)
+                currentLine = word
+            end
+        end
+        if currentLine ~= "" then
+            table.insert(lines, currentLine)
+        end
+
+        for i, line in ipairs(lines) do
+            love.graphics.print(line, 20, 105 + (i-1) * 15)
+        end
     end
 
-    -- Draw control instructions
+    -- Draw control instructions - UPDATED
     love.graphics.setColor(self.textColor)
 
     if not self.gameActive then
-        love.graphics.print("Press G to start game", 20, 125)
+        love.graphics.print("Press G to start game", 20, 140)
     else
         if self.allPlayersDead then
             love.graphics.setColor(self.errorColor)
-            love.graphics.print("ALL PLAYERS DEAD!", 20, 125)
+            love.graphics.print("ALL PLAYERS DEAD!", 20, 140)
         end
 
         -- ALWAYS show restart option for host
         love.graphics.setColor(self.textColor)
-        love.graphics.print("Press R to restart match", 20, 145)
+        love.graphics.print("Press R to restart match", 20, 155)
 
         if self.awaitingConfirmation then
             love.graphics.setColor(self.warningColor)
-            love.graphics.print("Press SPACE to start wave " .. self.wave, 20, 165)
+            love.graphics.print("Press SPACE or G to confirm wave " .. (self.wave + 1), 20, 170)
+            love.graphics.print("(Next wave requires host confirmation)", 20, 185)
+        elseif self.countdown > 0 then
+            love.graphics.setColor(self.successColor)
+            love.graphics.print("Wave " .. (self.wave + 1) .. " starts in " .. math.ceil(self.countdown) .. " seconds", 20, 170)
         end
     end
 

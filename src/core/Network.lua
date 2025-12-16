@@ -32,6 +32,10 @@ local Network = {
     -- Position update optimization
     lastSentPositions = {},    -- Track last sent position per player
     positionThreshold = 2.0,   -- Minimum movement required to send update
+
+    -- Enemy position optimization - ADDED
+    lastEnemyPositions = {},    -- Track last sent position per enemy
+    enemyPositionThreshold = 2.0, -- Minimum enemy movement required to send update
 }
 
 -- Private variables for network connections
@@ -195,6 +199,7 @@ end
 -- Clean up all enemies on server
 function Network.cleanupEnemies()
     Network.enemies = {}
+    Network.lastEnemyPositions = {}  -- ADDED: Clear enemy positions
     Network.lastEnemySpawnTime = 0
     print("Network: Enemies cleared")
 end
@@ -355,6 +360,7 @@ function Network.init(host, port, serverMode)
     Network.enemies = {}
     enemyAttackTimers = {}
     Network.lastSentPositions = {}
+    Network.lastEnemyPositions = {}  -- ADDED: Clear enemy positions
 
     if Network.isServer then
         -- Initialize WaveManager for server
@@ -730,7 +736,7 @@ function Network.onStartGame(data, clientObj)
     print("Server: Wave-based game started with 5-second countdown")
 end
 
--- Called when host confirms a wave
+-- Called when host confirms a wave - UPDATED VERSION
 function Network.onWaveConfirm(data, clientObj)
     local clientId = tostring(clientObj:getIndex())
     if clientId ~= "host" and clientId ~= "Host" then
@@ -739,19 +745,23 @@ function Network.onWaveConfirm(data, clientObj)
     end
 
     if not Network.waveManager or not Network.gameActive then
-        print("Server: Cannot confirm wave - game not active")
+        print("Server: Cannot confirm wave - game not active or no wave manager")
         return
     end
 
-    -- FIX: Check if we're actually awaiting confirmation
+    -- Check if we're actually awaiting confirmation
     local waveStatus = Network.waveManager:getStatus()
     if not waveStatus.awaitingConfirmation then
-        print("Server: Cannot confirm wave - not awaiting confirmation")
+        print("Server: Cannot confirm wave - not awaiting confirmation. Wave status:", waveStatus.wave)
         return
     end
 
-    if Network.waveManager:confirmWave() then
-        local waveData = Network.waveManager:getStatus()
+    print("Server: Host is confirming next wave...")
+    local waveData = Network.waveManager:confirmWave()
+
+    if waveData then
+        -- Update the current wave
+        Network.waveManager.currentWave = waveData.wave
 
         -- Broadcast wave start
         for id, player in pairs(Network.connectedPlayers) do
@@ -1155,7 +1165,7 @@ function Network.broadcastPlayerPositions()
     end
 end
 
--- ENEMY MANAGEMENT FUNCTIONS
+-- ENEMY MANAGEMENT FUNCTIONS - UPDATED VERSION
 function Network.spawnEnemy()
     if not Network.isServer or not server or not Network.waveManager then return nil end
 
@@ -1200,6 +1210,13 @@ function Network.spawnEnemy()
     -- Store enemy
     Network.enemies[enemyId] = enemyData
 
+    -- Initialize last position - ADDED
+    Network.lastEnemyPositions[enemyId] = {
+        x = spawnX,
+        y = spawnY,
+        health = enemyHealth
+    }
+
     -- Broadcast to all clients
     for _, player in pairs(Network.connectedPlayers) do
         if player and player.client then
@@ -1217,6 +1234,7 @@ function Network.spawnEnemy()
     return enemyId
 end
 
+-- UPDATED VERSION: Update enemies with position optimization
 function Network.updateEnemies(dt)
     if not Network.isServer or not Network.waveManager or not Network.waveManager.isWaveActive then return end
 
@@ -1266,6 +1284,9 @@ function Network.updateEnemies(dt)
             end
         end
 
+        -- Store old position for comparison
+        local oldX, oldY = enemy.x, enemy.y
+
         -- Move enemy toward nearest player
         if nearestPlayer and nearestDistance > 50 then
             local dx = nearestPlayer.x - enemy.x
@@ -1283,25 +1304,36 @@ function Network.updateEnemies(dt)
                     -- Apply damage to player
                     applyEnemyDamage(enemyId, enemy, nearestPlayer, targetType, targetId)
                 end
+            end
+        end
 
-                -- Broadcast update to all clients
-                for _, player in pairs(Network.connectedPlayers) do
-                    if player and player.client then
-                        MessageHandler:configureSendMode(player.client, "enemyUpdated")
-                        player.client:send("enemyUpdated", {
-                            id = enemyId,
-                            x = math.floor(enemy.x),
-                            y = math.floor(enemy.y),
-                            health = enemy.health,
-                            type = enemy.type,
-                            alive = enemy.health > 0 and 1 or 0
-                        })
-                    end
-                end
+        -- Only send position update if enemy moved significantly OR if health changed - ADDED OPTIMIZATION
+        local lastPos = Network.lastEnemyPositions[enemyId]
+        local shouldSendUpdate = false
 
-                -- Notify host
-                if Network.onEnemyUpdatedCallback then
-                    Network.onEnemyUpdatedCallback({
+        if not lastPos then
+            -- First time sending for this enemy
+            shouldSendUpdate = true
+            Network.lastEnemyPositions[enemyId] = {x = enemy.x, y = enemy.y, health = enemy.health}
+        else
+            -- Check if position changed significantly OR health changed
+            local dx = math.abs(enemy.x - lastPos.x)
+            local dy = math.abs(enemy.y - lastPos.y)
+            local dHealth = math.abs(enemy.health - lastPos.health)
+
+            if dx > Network.enemyPositionThreshold or dy > Network.enemyPositionThreshold or dHealth > 0 then
+                shouldSendUpdate = true
+                Network.lastEnemyPositions[enemyId] = {x = enemy.x, y = enemy.y, health = enemy.health}
+            end
+        end
+
+        -- Send update if needed
+        if shouldSendUpdate then
+            -- Broadcast update to all clients
+            for _, player in pairs(Network.connectedPlayers) do
+                if player and player.client then
+                    MessageHandler:configureSendMode(player.client, "enemyUpdated")
+                    player.client:send("enemyUpdated", {
                         id = enemyId,
                         x = math.floor(enemy.x),
                         y = math.floor(enemy.y),
@@ -1310,6 +1342,18 @@ function Network.updateEnemies(dt)
                         alive = enemy.health > 0 and 1 or 0
                     })
                 end
+            end
+
+            -- Notify host
+            if Network.onEnemyUpdatedCallback then
+                Network.onEnemyUpdatedCallback({
+                    id = enemyId,
+                    x = math.floor(enemy.x),
+                    y = math.floor(enemy.y),
+                    health = enemy.health,
+                    type = enemy.type,
+                    alive = enemy.health > 0 and 1 or 0
+                })
             end
         end
     end
