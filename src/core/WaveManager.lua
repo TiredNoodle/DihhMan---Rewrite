@@ -22,7 +22,7 @@ local WaveManager = class('WaveManager')
 
 function WaveManager:initialize()
     self.currentStage = 1
-    self.currentWave = 0
+    self.currentWave = 1  -- CHANGED: Start from wave 1
     self.isWaveActive = false
     self.waveCountdown = 0
     self.totalEnemies = 0
@@ -41,7 +41,7 @@ function WaveManager:initialize()
     -- Generate wave configs for multiple stages
     self:generateWaveConfigs()
 
-    print("WaveManager initialized")
+    print("WaveManager initialized. Starting at Wave 1.")
 
     -- Load modded enemies if they exist
     if _G.MOD_ENEMIES then
@@ -116,7 +116,7 @@ end
 
 function WaveManager:startGame()
     self.currentStage = 1
-    self.currentWave = 0
+    self.currentWave = 1  -- CHANGED: Start at wave 1
     self.isWaveActive = false
     self.gameActive = true
     self.totalEnemies = 0
@@ -143,7 +143,9 @@ function WaveManager:update(dt)
     if self.waveCountdown > 0 then
         self.waveCountdown = self.waveCountdown - dt
         if self.waveCountdown <= 0 then
-            local waveData = self:startNextWave()
+            -- When countdown hits 0, start the current wave
+            self.waveCountdown = 0
+            local waveData = self:startCurrentWave()
             return {
                 type = "wave_started",
                 data = waveData
@@ -169,34 +171,15 @@ function WaveManager:update(dt)
     return nil
 end
 
-function WaveManager:startNextWave()
-    self.currentWave = self.currentWave + 1
-
-    -- Check if we need to advance to next stage
-    if self.currentWave > self.wavesPerStage then
-        self.currentStage = self.currentStage + 1
-        self.currentWave = 1
-    end
-
+-- Start the current wave (used after countdown or confirmation)
+function WaveManager:startCurrentWave()
     local config = self.waveConfigs[self.currentStage][self.currentWave]
     self.totalEnemies = config.enemies
     self.enemiesAlive = 0  -- Will increase as enemies spawn
     self.enemiesSpawned = 0
     self.isWaveActive = true
-    self.awaitingConfirmation = config.requiresConfirmation
+    self.awaitingConfirmation = false  -- Not awaiting confirmation when wave is active
     self.lastEnemySpawnTime = 0
-
-    if self.awaitingConfirmation then
-        self.isWaveActive = false
-        return {
-            stage = self.currentStage,
-            wave = self.currentWave,
-            enemies = self.totalEnemies,
-            requiresConfirmation = true,
-            hasBoss = config.hasBoss,
-            message = "Wave " .. self.currentWave .. " (Stage " .. self.currentStage .. ") requires host confirmation"
-        }
-    end
 
     return {
         stage = self.currentStage,
@@ -211,70 +194,71 @@ end
 
 function WaveManager:confirmWave()
     if self.awaitingConfirmation then
-        self.awaitingConfirmation = false
-        self.isWaveActive = true
-        return true
+        print("WaveManager: Confirming wave " .. self.currentWave)
+        return self:startCurrentWave()
     end
-    return false
+    return nil
 end
 
 function WaveManager:completeWave()
     self.isWaveActive = false
 
-    -- Always give a 5-second break between waves
-    self.waveCountdown = 5
+    -- Get the wave we just completed
+    local completedWave = self.currentWave
+    local completedStage = self.currentStage
 
-    -- Check what the next wave would be
-    local nextWaveNum = self.currentWave + 1
-    local nextStageNum = self.currentStage
-
-    if nextWaveNum > self.wavesPerStage then
-        nextStageNum = nextStageNum + 1
-        nextWaveNum = 1
+    -- ADVANCE TO NEXT WAVE - CRITICAL FIX
+    self.currentWave = self.currentWave + 1
+    if self.currentWave > self.wavesPerStage then
+        self.currentStage = self.currentStage + 1
+        self.currentWave = 1
     end
 
     -- Check if next wave requires confirmation (every 3rd wave)
-    local nextWaveRequiresConfirmation = (nextWaveNum % 3 == 0)
+    local nextWaveRequiresConfirmation = (self.currentWave % 3 == 0)
 
     if nextWaveRequiresConfirmation then
-        -- Next wave requires confirmation, so stop auto-progression
-        self.waveCountdown = 0
+        -- Next wave requires confirmation
         self.awaitingConfirmation = true
+        self.waveCountdown = 0  -- No auto-countdown
     else
-        -- Next wave will auto-start after countdown
+        -- Next wave will auto-start after 5 seconds
         self.awaitingConfirmation = false
+        self.waveCountdown = 5
     end
 
     -- Check if all stages and waves completed
-    if self.currentStage >= 10 and self.currentWave >= self.wavesPerStage then
+    if completedStage >= 10 and completedWave >= self.wavesPerStage then
         self.gameActive = false
         return {
-            stage = self.currentStage,
-            wave = self.currentWave,
+            stage = completedStage,
+            wave = completedWave,
             completed = true,
             gameCompleted = true,
+            awaitingConfirmation = false,
             message = "CONGRATULATIONS! You completed all stages!",
-            requiresConfirmation = false
+            nextWaveRequiresConfirmation = nextWaveRequiresConfirmation
         }
     end
 
     -- Determine message based on next wave
     local message
     if nextWaveRequiresConfirmation then
-        message = "Wave " .. self.currentWave .. " (Stage " .. self.currentStage .. ") completed!" ..
-                 " Next wave requires host confirmation."
+        message = "Wave " .. completedWave .. " (Stage " .. completedStage .. ") completed!" ..
+                 " Host must press SPACE to confirm wave " .. self.currentWave .. "."
     else
-        message = "Wave " .. self.currentWave .. " (Stage " .. self.currentStage .. ") completed!" ..
-                 " Next wave in 5 seconds..."
+        message = "Wave " .. completedWave .. " (Stage " .. completedStage .. ") completed!" ..
+                 " Wave " .. self.currentWave .. " starts in 5 seconds..."
     end
 
     return {
-        stage = self.currentStage,
-        wave = self.currentWave,
+        stage = completedStage,  -- Return the wave we just completed
+        wave = completedWave,    -- Return the wave we just completed
         completed = true,
         gameCompleted = false,
+        awaitingConfirmation = self.awaitingConfirmation,
         message = message,
-        requiresConfirmation = nextWaveRequiresConfirmation
+        nextWaveRequiresConfirmation = nextWaveRequiresConfirmation
     }
 end
 
@@ -351,7 +335,7 @@ end
 
 function WaveManager:reset()
     self.currentStage = 1
-    self.currentWave = 0
+    self.currentWave = 1  -- CHANGED: Reset to wave 1
     self.isWaveActive = false
     self.gameActive = false
     self.waveCountdown = 0

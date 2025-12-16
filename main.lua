@@ -739,7 +739,7 @@ function drawDebugInfo()
     end
 end
 
--- INPUT HANDLING
+-- INPUT HANDLING - UPDATED VERSION
 function love.keypressed(key)
     -- Global key bindings
     if key == "escape" then
@@ -784,14 +784,15 @@ function love.keypressed(key)
             mainMenu:selectCurrent()
         end
     elseif gameState == "playing" then
-        -- Host controls
+        -- Host controls - UPDATED
         if Network.isServer then
             if key == "g" and not gameActive then
                 -- Start game
+                print("Host: Starting game with 'G' key")
                 Network.onStartGame({}, {getIndex = function() return "host" end})
-            elseif key == "space" and hostControl.awaitingConfirmation then
-                -- Confirm wave
-                print("Host: Attempting to confirm wave...")
+            elseif (key == "space" or key == "g") and hostControl.awaitingConfirmation then
+                -- Confirm wave with either SPACE or G
+                print("Host: Confirming wave with '" .. key .. "' key")
                 Network.onWaveConfirm({}, {getIndex = function() return "host" end})
             elseif key == "r" then
                 -- Restart game
