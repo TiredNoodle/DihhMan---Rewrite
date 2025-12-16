@@ -49,7 +49,6 @@ function WaveManager:initialize()
             self:registerEnemyType(typeName, def)
         end
     end
-
 end
 
 function WaveManager:registerEnemyType(typeName, enemyDef)
@@ -222,23 +221,28 @@ end
 function WaveManager:completeWave()
     self.isWaveActive = false
 
-    -- CRITICAL FIX: Only auto-start countdown for waves that don't require confirmation
-    local nextWave = self.currentWave + 1
-    local nextStage = self.currentStage
+    -- Always give a 5-second break between waves
+    self.waveCountdown = 5
 
-    if nextWave > self.wavesPerStage then
-        nextStage = nextStage + 1
-        nextWave = 1
+    -- Check what the next wave would be
+    local nextWaveNum = self.currentWave + 1
+    local nextStageNum = self.currentStage
+
+    if nextWaveNum > self.wavesPerStage then
+        nextStageNum = nextStageNum + 1
+        nextWaveNum = 1
     end
 
-    local nextConfig = self.waveConfigs[nextStage] and self.waveConfigs[nextStage][nextWave]
+    -- Check if next wave requires confirmation (every 3rd wave)
+    local nextWaveRequiresConfirmation = (nextWaveNum % 3 == 0)
 
-    if nextConfig and not nextConfig.requiresConfirmation then
-        -- Auto-start next wave after 5 seconds
-        self.waveCountdown = 5
-    else
-        -- Wave requires confirmation - don't auto-start
+    if nextWaveRequiresConfirmation then
+        -- Next wave requires confirmation, so stop auto-progression
         self.waveCountdown = 0
+        self.awaitingConfirmation = true
+    else
+        -- Next wave will auto-start after countdown
+        self.awaitingConfirmation = false
     end
 
     -- Check if all stages and waves completed
@@ -254,15 +258,23 @@ function WaveManager:completeWave()
         }
     end
 
+    -- Determine message based on next wave
+    local message
+    if nextWaveRequiresConfirmation then
+        message = "Wave " .. self.currentWave .. " (Stage " .. self.currentStage .. ") completed!" ..
+                 " Next wave requires host confirmation."
+    else
+        message = "Wave " .. self.currentWave .. " (Stage " .. self.currentStage .. ") completed!" ..
+                 " Next wave in 5 seconds..."
+    end
+
     return {
         stage = self.currentStage,
         wave = self.currentWave,
         completed = true,
         gameCompleted = false,
-        message = "Wave " .. self.currentWave .. " (Stage " .. self.currentStage .. ") completed!" ..
-                 (nextConfig and nextConfig.requiresConfirmation and
-                  " Host must confirm next wave." or " Next wave in 5 seconds..."),
-        requiresConfirmation = nextConfig and nextConfig.requiresConfirmation or false
+        message = message,
+        requiresConfirmation = nextWaveRequiresConfirmation
     }
 end
 

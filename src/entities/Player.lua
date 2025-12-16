@@ -33,19 +33,37 @@ function Player:initialize(name, x, y)
     self.actionStartTime = 0
     self.actionDuration = 0.2
 
-    -- Dash properties
+    -- Dash properties (ENHANCED FOR SMOOTH INTERPOLATION)
     self.isDashing = false
     self.dashProgress = 0
     self.dashDuration = 0.15  -- 150ms dash duration
+    self.dashStartX = nil
+    self.dashStartY = nil
     self.dashTargetX = nil
     self.dashTargetY = nil
     self.dashTargetCenterX = nil
     self.dashTargetCenterY = nil
+    self.dashDirectionX = nil
+    self.dashDirectionY = nil
 
     -- Effect timers
     self.attackEffectTimer = nil
     self.specialEffectTimer = nil
     self.dashEffectTimer = nil
+
+    -- Dash interpolation cache for network
+    self.lastDashTime = 0
+    self.dashNetworkTime = 0
+end
+
+-- Easing function for smooth dash interpolation
+function Player:easeOutCubic(t)
+    return 1 - math.pow(1 - t, 3)
+end
+
+-- Easing function for smooth deceleration
+function Player:easeInOutCubic(t)
+    return t < 0.5 and 4 * t * t * t or 1 - math.pow(-2 * t + 2, 3) / 2
 end
 
 function Player:update(dt)
@@ -59,7 +77,7 @@ function Player:update(dt)
     -- Update action effects
     self:updateActionEffects(dt)
 
-    -- Handle dashing
+    -- Handle dashing with smooth interpolation
     if self.isDashing then
         self.dashProgress = self.dashProgress + dt
 
@@ -70,14 +88,23 @@ function Player:update(dt)
                 self.x = self.dashTargetX
                 self.y = self.dashTargetY
             end
-        else
-            -- Interpolate during dash
-            local t = self.dashProgress / self.dashDuration
-            local startX, startY = self.x, self.y
+            self.dashProgress = self.dashDuration
 
-            if self.dashTargetX and self.dashTargetY then
-                self.x = startX + (self.dashTargetX - startX) * t
-                self.y = startY + (self.dashTargetY - startY) * t
+            -- Clear dash effect
+            self.dashEffectTimer = nil
+        else
+            -- Smooth interpolation during dash with easing
+            local t = self.dashProgress / self.dashDuration
+            t = self:easeOutCubic(t)  -- Smooth acceleration
+
+            if self.dashStartX and self.dashStartY and self.dashTargetX and self.dashTargetY then
+                self.x = self.dashStartX + (self.dashTargetX - self.dashStartX) * t
+                self.y = self.dashStartY + (self.dashTargetY - self.dashStartY) * t
+            end
+
+            -- Show dash effect during movement
+            if self.dashEffectTimer == nil then
+                self.dashEffectTimer = self.dashDuration
             end
         end
     end
@@ -164,11 +191,10 @@ function Player:performAction(actionName)
 
     -- Handle dash separately
     if actionName == "dash" then
-        return self:performDash()
+        return self:performDash(attackDirection)
     end
 
     -- Create action data to send to server
-    -- The server will handle finding targets and applying damage
     local actionData = {
         playerId = self.name,
         action = actionName,
@@ -188,8 +214,7 @@ function Player:performAction(actionName)
         -- Host triggers its own effect locally
         self:triggerActionEffect(actionName, nil, nil, nil)
 
-        -- Also process the action through server logic (this will handle damage)
-        -- We need to simulate receiving the action as if from a client
+        -- Also process the action through server logic
         Network.onPlayerAction(actionData, {getIndex = function() return "host" end})
     elseif self.isLocalPlayer and Network and not Network.isServer then
         -- Client triggers local effect (visual only)
@@ -199,48 +224,35 @@ function Player:performAction(actionName)
     return actionData
 end
 
--- Simplified: Just triggers visual effects, damage is handled by server
-function Player:completeAction()
-    if not self.currentAction then return end
-
-    -- Clear action state
-    self.currentAction = nil
-    self.actionTarget = nil
-end
-
-function Player:performDash()
+-- Enhanced dash with proper network synchronization
+function Player:performDash(direction)
     local action = self.actions.dash
 
     -- Don't dash if already dashing
     if self.isDashing then return end
 
     -- Calculate dash direction
-    local dashX, dashY = 0, 0
-
-    if self.lastMoveDirection and (self.lastMoveDirection.x ~= 0 or self.lastMoveDirection.y ~= 0) then
-        dashX = self.lastMoveDirection.x
-        dashY = self.lastMoveDirection.y
-    elseif math.abs(self.velocity.x) > 0 or math.abs(self.velocity.y) > 0 then
-        -- Normalize velocity for dash direction
-        local length = math.sqrt(self.velocity.x^2 + self.velocity.y^2)
-        dashX = self.velocity.x / length
-        dashY = self.velocity.y / length
-    else
-        -- Default dash forward (up)
-        dashY = -1
-    end
+    local dashX, dashY = direction.x, direction.y
 
     -- Normalize the dash direction
     local dirLength = math.sqrt(dashX^2 + dashY^2)
     if dirLength > 0 then
         dashX = dashX / dirLength
         dashY = dashY / dirLength
+    else
+        -- Default dash forward (up)
+        dashX = 0
+        dashY = -1
     end
 
     -- Calculate dash distance
     local dashDistance = action.distance * 1.5  -- Increased dash distance
 
-    -- Calculate dash target positions
+    -- Store start position for smooth interpolation
+    self.dashStartX = self.x
+    self.dashStartY = self.y
+
+    -- Calculate dash target positions (top-left coordinates)
     self.dashTargetX = self.x + dashX * dashDistance
     self.dashTargetY = self.y + dashY * dashDistance
 
@@ -249,19 +261,28 @@ function Player:performDash()
     self.dashTargetCenterX = centerX + dashX * dashDistance
     self.dashTargetCenterY = centerY + dashY * dashDistance
 
+    -- Store dash direction for network
+    self.dashDirectionX = dashX
+    self.dashDirectionY = dashY
+
     -- Start dash
     self.isDashing = true
     self.dashProgress = 0
+    self.lastDashTime = love.timer.getTime()
 
-    -- Send dash action to network
+    -- Send dash action to network with ALL necessary parameters
     local actionData = {
         playerId = self.name,
         action = "dash",
-        x = centerX,
-        y = centerY,
-        direction = {x = dashX, y = dashY},
-        targetX = self.dashTargetCenterX,  -- Send CENTER coordinates
-        targetY = self.dashTargetCenterY
+        x = centerX,  -- Start center X
+        y = centerY,  -- Start center Y
+        directionX = dashX,
+        directionY = dashY,
+        distance = dashDistance,
+        duration = self.dashDuration,
+        timestamp = self.lastDashTime,
+        targetX = self.dashTargetCenterX,  -- Target center X
+        targetY = self.dashTargetCenterY   -- Target center Y
     }
 
     -- Send to network
@@ -349,17 +370,59 @@ end
 
 -- Apply action effect from network (visual only)
 function Player:applyActionEffect(effectData)
+    -- Check if this action is for us
+    if not effectData or effectData.playerId ~= self.name then
+        return
+    end
+
     -- Trigger the visual effect for this player
-    if effectData.action and effectData.playerId == self.name then
+    if effectData.action then
         self:triggerActionEffect(effectData.action, effectData.targetId, effectData.targetX, effectData.targetY)
 
         -- Handle dash movement from network
-        if effectData.action == "dash" and effectData.targetX and effectData.targetY then
-            -- Convert center coordinates to top-left
-            self.x = effectData.targetX - self.width/2
-            self.y = effectData.targetY - self.height/2
+        if effectData.action == "dash" then
+            -- Store dash parameters for smooth interpolation
+            self.dashNetworkTime = love.timer.getTime()
+
+            if effectData.directionX and effectData.directionY and effectData.distance then
+                -- Calculate dash from parameters
+                local centerX, centerY = self:getCenter()
+                self.dashStartX = self.x
+                self.dashStartY = self.y
+                self.dashTargetCenterX = centerX + effectData.directionX * effectData.distance
+                self.dashTargetCenterY = centerY + effectData.directionY * effectData.distance
+                self.dashTargetX = self.dashTargetCenterX - self.width/2
+                self.dashTargetY = self.dashTargetCenterY - self.height/2
+                self.isDashing = true
+                self.dashProgress = 0
+                self.dashDirectionX = effectData.directionX
+                self.dashDirectionY = effectData.directionY
+            elseif effectData.targetX and effectData.targetY then
+                -- Use provided target position
+                self.dashStartX = self.x
+                self.dashStartY = self.y
+                self.dashTargetCenterX = effectData.targetX
+                self.dashTargetCenterY = effectData.targetY
+                self.dashTargetX = effectData.targetX - self.width/2
+                self.dashTargetY = effectData.targetY - self.height/2
+                self.isDashing = true
+                self.dashProgress = 0
+            end
+
+            -- Use provided duration or default
+            if effectData.duration then
+                self.dashDuration = effectData.duration
+            end
         end
     end
+end
+
+function Player:completeAction()
+    if not self.currentAction then return end
+
+    -- Clear action state
+    self.currentAction = nil
+    self.actionTarget = nil
 end
 
 function Player:getCenter()

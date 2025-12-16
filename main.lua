@@ -27,6 +27,10 @@ local enemyCreationTimestamps = {}
 local allPlayersDead = false
 local gameActive = false
 
+-- Position update optimization
+local lastSentState = nil
+local positionThreshold = 2.0  -- Minimum movement required to send update
+
 -- DEBUG: Track frame count for periodic logging
 local frameCount = 0
 local lastDebugOutput = 0
@@ -100,6 +104,7 @@ function setupNetworkCallbacks()
     Network.setPlayerIdCallback(function(data)
         myPlayerId = data.id
         print("Network: Received player ID from server: " .. myPlayerId)
+        lastSentState = nil  -- Reset for new player
     end)
 
     -- Called when server sends initial game state
@@ -112,6 +117,7 @@ function setupNetworkCallbacks()
         localPlayer = nil
         remotePlayers = {}
         enemies = {}
+        lastSentState = nil
 
         -- Create players from server data
         if data.players then
@@ -191,6 +197,7 @@ function setupNetworkCallbacks()
             localPlayer.health = 100
             localPlayer.isAlive = true
         end
+        lastSentState = nil
     end)
 
     -- Called when a new player joins the game
@@ -228,6 +235,7 @@ function setupNetworkCallbacks()
             print("Network: Server corrected our position")
             localPlayer.x = data.x
             localPlayer.y = data.y
+            lastSentState = nil  -- Force resend
         end
     end)
 
@@ -338,6 +346,13 @@ function createLocalPlayer(name, x, y, health, isAlive)
         localPlayer.isAlive = isAlive
     end
 
+    -- Initialize last sent state
+    lastSentState = {
+        x = localPlayer.x + localPlayer.width/2,
+        y = localPlayer.y + localPlayer.height/2,
+        health = localPlayer.health
+    }
+
     print(string.format("Local player '%s' created at (%d, %d) Health: %d Alive: %s",
           name, spawnX, spawnY, localPlayer.health, tostring(localPlayer.isAlive)))
 end
@@ -445,6 +460,7 @@ function cleanupGame()
     enemyCreationTimestamps = {}
     allPlayersDead = false
     gameActive = false
+    lastSentState = nil
 
     print("Game state cleaned up")
 end
@@ -491,35 +507,57 @@ function love.update(dt)
         -- Add a position sync system to ensure players see each other move
         PositionSync.update(dt)
 
-        -- Update local player and send state to server
+        -- Update local player and send state to server (OPTIMIZED: Only send on change)
         if localPlayer and localPlayer.isAlive then
             localPlayer:update(dt)
 
             if Network.isConnected() and localPlayer.isLocalPlayer then
-                -- Send position updates at a controlled rate
-                local currentTime = love.timer.getTime()
-                if not localPlayer.lastSendTime or (currentTime - localPlayer.lastSendTime) > 0.05 then -- 20 times/sec
-                    local state = localPlayer:getNetworkState()
+                -- Get current state
+                local currentState = localPlayer:getNetworkState()
 
+                -- Check if we should send an update
+                local shouldSend = false
+
+                if not lastSentState then
+                    shouldSend = true  -- First time sending
+                else
+                    -- Check position change
+                    local dx = math.abs(currentState.x - lastSentState.x)
+                    local dy = math.abs(currentState.y - lastSentState.y)
+                    local dHealth = math.abs(currentState.health - lastSentState.health)
+
+                    -- Send if position changed significantly OR health changed
+                    if dx > positionThreshold or dy > positionThreshold or dHealth > 0 then
+                        shouldSend = true
+                    end
+                end
+
+                if shouldSend then
                     -- Validate state before sending
-                    if state and type(state) == "table" and state.x and state.y and state.health then
+                    if currentState and type(currentState) == "table" and
+                       currentState.x and currentState.y and currentState.health then
                         -- Ensure values are valid numbers
-                        if tonumber(state.x) and tonumber(state.y) and tonumber(state.health) then
+                        if tonumber(currentState.x) and tonumber(currentState.y) and tonumber(currentState.health) then
                             if not Network.isServer then
                                 -- Client: Send state to server
-                                Network.sendPlayerState(state)
+                                Network.sendPlayerState(currentState)
                             else
                                 -- Host: Update internal state
-                                Network.setHostPlayerData(state)
+                                Network.setHostPlayerData(currentState)
                             end
+
+                            -- Update last sent state
+                            lastSentState = {
+                                x = currentState.x,
+                                y = currentState.y,
+                                health = currentState.health
+                            }
                         else
-                            print("DEBUG: Invalid number values in player state:", state.x, state.y, state.health)
+                            print("DEBUG: Invalid number values in player state:", currentState.x, currentState.y, currentState.health)
                         end
                     else
-                        print("DEBUG: Invalid player state structure:", state)
+                        print("DEBUG: Invalid player state structure:", currentState)
                     end
-
-                    localPlayer.lastSendTime = currentTime
                 end
             end
         end
@@ -690,6 +728,15 @@ function drawDebugInfo()
     love.graphics.print("Enemies: " .. tableCount(enemies), 555, yPos)
     yPos = yPos + 20
     love.graphics.print("Game Active: " .. tostring(gameActive), 555, yPos)
+
+    -- Position update info
+    yPos = yPos + 20
+    if localPlayer and lastSentState then
+        local centerX, centerY = localPlayer:getCenter()
+        local dx = math.abs(centerX - lastSentState.x)
+        local dy = math.abs(centerY - lastSentState.y)
+        love.graphics.print("Pos Delta: " .. string.format("%.1f, %.1f", dx, dy), 555, yPos)
+    end
 end
 
 -- INPUT HANDLING
@@ -744,6 +791,7 @@ function love.keypressed(key)
                 Network.onStartGame({}, {getIndex = function() return "host" end})
             elseif key == "space" and hostControl.awaitingConfirmation then
                 -- Confirm wave
+                print("Host: Attempting to confirm wave...")
                 Network.onWaveConfirm({}, {getIndex = function() return "host" end})
             elseif key == "r" then
                 -- Restart game
