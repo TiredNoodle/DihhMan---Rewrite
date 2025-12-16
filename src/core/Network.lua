@@ -28,6 +28,10 @@ local Network = {
 
     -- Game state persistence
     persistentPlayerStates = {}, -- Keep player states even after disconnect
+
+    -- Position update optimization
+    lastSentPositions = {},    -- Track last sent position per player
+    positionThreshold = 2.0,   -- Minimum movement required to send update
 }
 
 -- Private variables for network connections
@@ -320,6 +324,24 @@ local function updateEnemyAttackTimers(dt)
     end
 end
 
+-- Check if position has changed significantly
+local function positionChanged(playerId, newX, newY)
+    local lastPos = Network.lastSentPositions[playerId]
+    if not lastPos then
+        return true  -- First time sending
+    end
+
+    local dx = math.abs(newX - lastPos.x)
+    local dy = math.abs(newY - lastPos.y)
+
+    return dx > Network.positionThreshold or dy > Network.positionThreshold
+end
+
+-- Update last sent position
+local function updateLastSentPosition(playerId, x, y)
+    Network.lastSentPositions[playerId] = {x = x, y = y}
+end
+
 -- INITIALIZATION
 function Network.init(host, port, serverMode)
     Network.isServer = serverMode
@@ -332,6 +354,7 @@ function Network.init(host, port, serverMode)
     Network.persistentPlayerStates = {}
     Network.enemies = {}
     enemyAttackTimers = {}
+    Network.lastSentPositions = {}
 
     if Network.isServer then
         -- Initialize WaveManager for server
@@ -571,8 +594,12 @@ function Network.update(dt)
         -- Periodically broadcast host updates to all clients
         local currentTime = love.timer.getTime()
         if Network.hostPlayerData and currentTime - Network.lastHostUpdateTime > Network.hostUpdateInterval then
-            broadcastHostUpdate()
-            Network.lastHostUpdateTime = currentTime
+            -- Only broadcast if position changed significantly
+            if positionChanged("Host", Network.hostPlayerData.x, Network.hostPlayerData.y) then
+                broadcastHostUpdate()
+                updateLastSentPosition("Host", Network.hostPlayerData.x, Network.hostPlayerData.y)
+                Network.lastHostUpdateTime = currentTime
+            end
         end
 
         -- Check if all players are dead and broadcast game over
@@ -608,7 +635,9 @@ function Network.onClientConnected(clientObj, data)
         id = clientId,
         x = spawnX,
         y = spawnY,
-        health = 100
+        health = 100,
+        lastSentX = spawnX,
+        lastSentY = spawnY
     }
 
     -- Send the client its player ID
@@ -714,6 +743,13 @@ function Network.onWaveConfirm(data, clientObj)
         return
     end
 
+    -- FIX: Check if we're actually awaiting confirmation
+    local waveStatus = Network.waveManager:getStatus()
+    if not waveStatus.awaitingConfirmation then
+        print("Server: Cannot confirm wave - not awaiting confirmation")
+        return
+    end
+
     if Network.waveManager:confirmWave() then
         local waveData = Network.waveManager:getStatus()
 
@@ -765,6 +801,7 @@ function Network.onRestartGame(data, clientObj)
     Network.enemies = {}
     Network.lastEnemySpawnTime = 0
     enemyAttackTimers = {}
+    Network.lastSentPositions = {}
 
     -- Reset wave manager
     if Network.waveManager then
@@ -774,6 +811,8 @@ function Network.onRestartGame(data, clientObj)
     -- Reset all players
     for id, player in pairs(Network.connectedPlayers) do
         player.health = 100
+        player.lastSentX = player.x
+        player.lastSentY = player.y
     end
 
     -- Reset persistent states
@@ -835,6 +874,7 @@ function Network.onClientDisconnected(clientObj, data)
 
     -- Remove from connected players
     Network.connectedPlayers[clientId] = nil
+    Network.lastSentPositions[clientId] = nil
 
     -- Broadcast updated state
     broadcastGameState()
@@ -867,7 +907,7 @@ function Network.onPlayerUpdate(data, clientObj)
         return
     end
 
-    -- Accept the update (remove collision validation for now to test)
+    -- Accept the update
     playerData.x = data.x
     playerData.y = data.y
     playerData.health = data.health
@@ -880,11 +920,25 @@ function Network.onPlayerUpdate(data, clientObj)
         Network.persistentPlayerStates[clientId].alive = data.health > 0
     end
 
-    -- Broadcast update to all other clients (including host via callback)
-    for id, player in pairs(Network.connectedPlayers) do
-        if id ~= clientId and player and player.client then
-            MessageHandler:configureSendMode(player.client, "playerUpdated")
-            player.client:send("playerUpdated", {
+    -- Only broadcast update if position changed significantly
+    if positionChanged(clientId, data.x, data.y) or data.health ~= oldHealth then
+        -- Broadcast update to all other clients (including host via callback)
+        for id, player in pairs(Network.connectedPlayers) do
+            if id ~= clientId and player and player.client then
+                MessageHandler:configureSendMode(player.client, "playerUpdated")
+                player.client:send("playerUpdated", {
+                    id = clientId,
+                    x = playerData.x,
+                    y = playerData.y,
+                    health = playerData.health,
+                    alive = playerData.health > 0
+                })
+            end
+        end
+
+        -- Also update host via callback
+        if Network.onPlayerUpdatedCallback then
+            Network.onPlayerUpdatedCallback({
                 id = clientId,
                 x = playerData.x,
                 y = playerData.y,
@@ -892,24 +946,18 @@ function Network.onPlayerUpdate(data, clientObj)
                 alive = playerData.health > 0
             })
         end
-    end
 
-    -- Also update host via callback
-    if Network.onPlayerUpdatedCallback then
-        Network.onPlayerUpdatedCallback({
-            id = clientId,
-            x = playerData.x,
-            y = playerData.y,
-            health = playerData.health,
-            alive = playerData.health > 0
-        })
-    end
+        -- Update last sent position
+        updateLastSentPosition(clientId, data.x, data.y)
+        playerData.lastSentX = data.x
+        playerData.lastSentY = data.y
 
-    print(string.format("Server: Updated player %s to position (%d, %d)",
-          clientId, playerData.x, playerData.y))
+        print(string.format("Server: Updated player %s to position (%d, %d)",
+              clientId, playerData.x, playerData.y))
+    end
 end
 
--- PLAYER ACTION HANDLING
+-- PLAYER ACTION HANDLING - FIXED FOR DASH
 function Network.onPlayerAction(data, clientObj)
     if not data or not data.action then return end
 
@@ -919,20 +967,21 @@ function Network.onPlayerAction(data, clientObj)
         senderPlayerId = "Host"
     end
 
-    -- Handle dash movement
-    if data.action == "dash" and data.targetX and data.targetY then
-        local senderPlayerId = clientId
-        if data.playerId == "Host" or data.playerId == "host" then
-            senderPlayerId = "Host"
-        end
+    -- Handle dash movement with full parameters
+    if data.action == "dash" and (data.targetX and data.targetY) then
+        print(string.format("Server: Player %s dashing to (%.1f, %.1f)",
+              senderPlayerId, data.targetX, data.targetY))
 
-        -- Update player position for dash
+        -- Update player position immediately for server authoritative movement
         if senderPlayerId == "Host" and Network.hostPlayerData then
             Network.hostPlayerData.x = data.targetX
             Network.hostPlayerData.y = data.targetY
+            -- Force position update for dash
+            updateLastSentPosition("Host", data.targetX, data.targetY)
         elseif Network.connectedPlayers[senderPlayerId] then
             Network.connectedPlayers[senderPlayerId].x = data.targetX
             Network.connectedPlayers[senderPlayerId].y = data.targetY
+            updateLastSentPosition(senderPlayerId, data.targetX, data.targetY)
         end
     end
 
@@ -1012,7 +1061,7 @@ function Network.onPlayerAction(data, clientObj)
         end
     end
 
-    -- Broadcast action to all other clients
+    -- Broadcast action to all other clients with ALL parameters
     for id, player in pairs(Network.connectedPlayers) do
         if id ~= clientId and player and player.client then
             MessageHandler:configureSendMode(player.client, "playerAction")
@@ -1022,9 +1071,14 @@ function Network.onPlayerAction(data, clientObj)
                 x = data.x,
                 y = data.y,
                 direction = data.direction,
+                directionX = data.directionX,
+                directionY = data.directionY,
+                distance = data.distance,
+                duration = data.duration,
                 targetId = data.targetId,
                 targetX = data.targetX,
-                targetY = data.targetY
+                targetY = data.targetY,
+                timestamp = data.timestamp
             })
         end
     end
@@ -1037,9 +1091,14 @@ function Network.onPlayerAction(data, clientObj)
             x = data.x,
             y = data.y,
             direction = data.direction,
+            directionX = data.directionX,
+            directionY = data.directionY,
+            distance = data.distance,
+            duration = data.duration,
             targetId = data.targetId,
             targetX = data.targetX,
-            targetY = data.targetY
+            targetY = data.targetY,
+            timestamp = data.timestamp
         })
     end
 end
@@ -1056,34 +1115,43 @@ function Network.broadcastPlayerPositions()
 
     -- Send all player positions to all clients
     for clientId, playerData in pairs(Network.connectedPlayers) do
-        for otherId, otherPlayer in pairs(Network.connectedPlayers) do
-            if clientId ~= otherId and otherPlayer and otherPlayer.client then
-                MessageHandler:configureSendMode(otherPlayer.client, "playerUpdated")
-                otherPlayer.client:send("playerUpdated", {
-                    id = clientId,
-                    x = playerData.x,
-                    y = playerData.y,
-                    health = playerData.health,
-                    alive = playerData.health > 0
-                })
-            end
-        end
-
-        -- Also send host player to all clients
-        if Network.hostPlayerData then
-            for _, player in pairs(Network.connectedPlayers) do
-                if player and player.client then
-                    MessageHandler:configureSendMode(player.client, "playerUpdated")
-                    player.client:send("playerUpdated", {
-                        id = "Host",
-                        x = Network.hostPlayerData.x,
-                        y = Network.hostPlayerData.y,
-                        health = Network.hostPlayerData.health,
-                        alive = Network.hostPlayerData.health > 0
+        -- Only send if position changed significantly
+        if positionChanged(clientId, playerData.x, playerData.y) then
+            for otherId, otherPlayer in pairs(Network.connectedPlayers) do
+                if clientId ~= otherId and otherPlayer and otherPlayer.client then
+                    MessageHandler:configureSendMode(otherPlayer.client, "playerUpdated")
+                    otherPlayer.client:send("playerUpdated", {
+                        id = clientId,
+                        x = playerData.x,
+                        y = playerData.y,
+                        health = playerData.health,
+                        alive = playerData.health > 0
                     })
                 end
             end
+
+            -- Update last sent position
+            updateLastSentPosition(clientId, playerData.x, playerData.y)
+            playerData.lastSentX = playerData.x
+            playerData.lastSentY = playerData.y
         end
+    end
+
+    -- Also send host player to all clients (if position changed)
+    if Network.hostPlayerData and positionChanged("Host", Network.hostPlayerData.x, Network.hostPlayerData.y) then
+        for _, player in pairs(Network.connectedPlayers) do
+            if player and player.client then
+                MessageHandler:configureSendMode(player.client, "playerUpdated")
+                player.client:send("playerUpdated", {
+                    id = "Host",
+                    x = Network.hostPlayerData.x,
+                    y = Network.hostPlayerData.y,
+                    health = Network.hostPlayerData.health,
+                    alive = Network.hostPlayerData.health > 0
+                })
+            end
+        end
+        updateLastSentPosition("Host", Network.hostPlayerData.x, Network.hostPlayerData.y)
     end
 end
 
@@ -1459,6 +1527,7 @@ function Network.disconnect()
         Network.gameActive = false
         Network.allPlayersDead = false
         Network.canAcceptPlayers = true
+        Network.lastSentPositions = {}
     else
         -- Client: disconnect from server
         if client and client:isConnected() then

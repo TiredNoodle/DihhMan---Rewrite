@@ -35,6 +35,17 @@ function NetworkPlayer:initialize(playerId, x, y)
     -- Add interpolation properties
     self.interpolationSpeed = 8.0
 
+    -- Dash properties for network players
+    self.isDashing = false
+    self.dashProgress = 0
+    self.dashDuration = 0.15
+    self.dashStartX = nil
+    self.dashStartY = nil
+    self.dashTargetX = nil
+    self.dashTargetY = nil
+    self.dashDirectionX = nil
+    self.dashDirectionY = nil
+
     print(string.format("NetworkPlayer created: ID=%s at center (%d, %d)", playerId, x, y))
 end
 
@@ -42,37 +53,83 @@ function NetworkPlayer:update(dt)
     -- Call parent update for health bar and base movement
     Player.update(self, dt)
 
-    -- Interpolate position if we have target positions
-    if self.targetCenterX ~= self.centerX or self.targetCenterY ~= self.centerY then
-        -- Calculate distance to target
-        local dx = self.targetCenterX - self.centerX
-        local dy = self.targetCenterY - self.centerY
-        local distance = math.sqrt(dx * dx + dy * dy)
+    -- Handle dashing for network players
+    if self.isDashing then
+        self.dashProgress = self.dashProgress + dt
 
-        if distance < 2 then
-            -- Close enough, snap to target
-            self.centerX = self.targetCenterX
-            self.centerY = self.targetCenterY
+        if self.dashProgress >= self.dashDuration then
+            -- Complete dash
+            self.isDashing = false
+            if self.dashTargetX and self.dashTargetY then
+                self.centerX = self.dashTargetX
+                self.centerY = self.dashTargetY
+                self.x = self.centerX - self.width/2
+                self.y = self.centerY - self.height/2
+                self.targetCenterX = self.centerX
+                self.targetCenterY = self.centerY
+            end
+            self.dashProgress = self.dashDuration
         else
-            -- Smooth interpolation with easing
-            local moveDist = self.interpolationSpeed * distance * dt
-            if moveDist > distance then
+            -- Smooth interpolation during dash with easing
+            local t = self.dashProgress / self.dashDuration
+            t = self:easeOutCubic(t)  -- Smooth acceleration
+
+            if self.dashStartX and self.dashStartY and self.dashTargetX and self.dashTargetY then
+                self.centerX = self.dashStartX + (self.dashTargetX - self.dashStartX) * t
+                self.centerY = self.dashStartY + (self.dashTargetY - self.dashStartY) * t
+                self.x = self.centerX - self.width/2
+                self.y = self.centerY - self.height/2
+                self.targetCenterX = self.centerX
+                self.targetCenterY = self.centerY
+            end
+        end
+    else
+        -- Normal position interpolation when not dashing
+        if self.targetCenterX ~= self.centerX or self.targetCenterY ~= self.centerY then
+            -- Calculate distance to target
+            local dx = self.targetCenterX - self.centerX
+            local dy = self.targetCenterY - self.centerY
+            local distance = math.sqrt(dx * dx + dy * dy)
+
+            if distance < 2 then
+                -- Close enough, snap to target
                 self.centerX = self.targetCenterX
                 self.centerY = self.targetCenterY
             else
-                self.centerX = self.centerX + (dx / distance) * moveDist
-                self.centerY = self.centerY + (dy / distance) * moveDist
+                -- Smooth interpolation with easing
+                local moveDist = self.interpolationSpeed * distance * dt
+                if moveDist > distance then
+                    self.centerX = self.targetCenterX
+                    self.centerY = self.targetCenterY
+                else
+                    self.centerX = self.centerX + (dx / distance) * moveDist
+                    self.centerY = self.centerY + (dy / distance) * moveDist
+                end
             end
-        end
 
-        -- Update top-left corner for drawing (to match center position)
-        self.x = self.centerX - self.width/2
-        self.y = self.centerY - self.height/2
+            -- Update top-left corner for drawing (to match center position)
+            self.x = self.centerX - self.width/2
+            self.y = self.centerY - self.height/2
+        end
     end
 end
 
 function NetworkPlayer:applyNetworkUpdate(data)
     if not data then return end
+
+    -- If we're currently dashing, don't update position from normal updates
+    if self.isDashing then
+        -- Only update health during dash
+        if data.health and data.health ~= self.health then
+            local oldHealth = self.health
+            self.health = data.health
+            if data.health < oldHealth then
+                self:showHealthBarTemporarily()
+            end
+            self.isAlive = self.health > 0
+        end
+        return
+    end
 
     -- Store new target CENTER position for interpolation
     if data.x and data.y then
@@ -130,15 +187,41 @@ function NetworkPlayer:applyActionEffect(effectData)
         -- Trigger the visual effect
         self:triggerActionEffect(effectData.action, effectData.targetId, effectData.targetX, effectData.targetY)
 
-        -- CRITICAL: Apply dash movement if it's a dash
-        if effectData.action == "dash" and effectData.targetX and effectData.targetY then
-            -- Dash uses center coordinates
-            self.x = effectData.targetX - self.width/2
-            self.y = effectData.targetY - self.height/2
-            self.centerX = effectData.targetX
-            self.centerY = effectData.targetY
-            self.targetCenterX = effectData.targetX
-            self.targetCenterY = effectData.targetY
+        -- Handle dash with proper interpolation
+        if effectData.action == "dash" then
+            -- Store dash parameters for smooth interpolation
+            if effectData.directionX and effectData.directionY and effectData.distance then
+                -- Calculate dash from parameters
+                self.dashStartX = self.centerX
+                self.dashStartY = self.centerY
+                self.dashTargetX = self.centerX + effectData.directionX * effectData.distance
+                self.dashTargetY = self.centerY + effectData.directionY * effectData.distance
+                self.isDashing = true
+                self.dashProgress = 0
+                self.dashDirectionX = effectData.directionX
+                self.dashDirectionY = effectData.directionY
+
+                -- Update duration if provided
+                if effectData.duration then
+                    self.dashDuration = effectData.duration
+                end
+
+                print(string.format("NetworkPlayer %s: Starting dash from (%.1f, %.1f) to (%.1f, %.1f)",
+                      self.id, self.dashStartX, self.dashStartY, self.dashTargetX, self.dashTargetY))
+            elseif effectData.targetX and effectData.targetY then
+                -- Use provided target position
+                self.dashStartX = self.centerX
+                self.dashStartY = self.centerY
+                self.dashTargetX = effectData.targetX
+                self.dashTargetY = effectData.targetY
+                self.isDashing = true
+                self.dashProgress = 0
+
+                -- Update duration if provided
+                if effectData.duration then
+                    self.dashDuration = effectData.duration
+                end
+            end
         end
 
         print("NetworkPlayer " .. self.id .. " triggered action effect for " .. effectData.action)
